@@ -26,8 +26,8 @@ def learning_rate(args, params):
 
 def train(args, params):
     # Model
-    model = nn.yolo_v8_n(len(params['names'].values())).cuda()
-
+    model = nn.yolo_v8_l(len(params['names'].values())).cuda()
+    
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
     params['weight_decay'] *= args.batch_size * args.world_size * accumulate / 64
@@ -54,12 +54,13 @@ def train(args, params):
     # EMA
     ema = util.EMA(model) if args.local_rank == 0 else None
 
-    filenames = []
-    with open('../Dataset/COCO/train2017.txt') as reader:
-        for filename in reader.readlines():
-            filename = filename.rstrip().split('/')[-1]
-            filenames.append('../Dataset/COCO/images/train2017/' + filename)
-
+    train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/train/'
+    train_img_files = os.listdir(train_img_path)
+    filenames = [train_img_path + x for x in train_img_files]
+    # with open('../Dataset/COCO/train2017.txt') as reader:
+    #     for filename in reader.readlines():
+    #         filename = filename.rstrip().split('/')[-1]
+    #         filenames.append('../Dataset/COCO/images/train2017/' + filename)    
     dataset = Dataset(filenames, args.input_size, params, True)
 
     if args.world_size <= 1:
@@ -189,14 +190,19 @@ def train(args, params):
 
 @torch.no_grad()
 def test(args, params, model=None):
-    filenames = []
-    with open('../Dataset/COCO/val2017.txt') as reader:
-        for filename in reader.readlines():
-            filename = filename.rstrip().split('/')[-1]
-            filenames.append('../Dataset/COCO/images/val2017/' + filename)
+    # filenames = []
+    # with open('../Dataset/COCO/val2017.txt') as reader:
+    #     for filename in reader.readlines():
+    #         filename = filename.rstrip().split('/')[-1]
+    #         filenames.append('../Dataset/COCO/images/val2017/' + filename)
+
+    val_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/val/'
+    val_img_files = os.listdir(val_img_path)
+    filenames = [val_img_path + x for x in val_img_files]   
 
     dataset = Dataset(filenames, args.input_size, params, False)
-    loader = data.DataLoader(dataset, 8, False, num_workers=8,
+    # changed val batch size from 8 to 32
+    loader = data.DataLoader(dataset, 32, False, num_workers=8,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if model is None:
@@ -286,12 +292,11 @@ def test(args, params, model=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
-    parser.add_argument('--batch-size', default=32, type=int)
+    parser.add_argument('--batch-size', default=16, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
-    parser.add_argument('--epochs', default=500, type=int)
+    parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
-
     args = parser.parse_args()
 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
@@ -319,3 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

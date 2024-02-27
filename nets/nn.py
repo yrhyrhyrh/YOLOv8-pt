@@ -155,7 +155,7 @@ class Head(torch.nn.Module):
     anchors = torch.empty(0)
     strides = torch.empty(0)
 
-    def __init__(self, nc=80, filters=()):
+    def __init__(self, nc=1, filters=()):
         super().__init__()
         self.ch = 16  # DFL channels
         self.nc = nc  # number of classes
@@ -243,7 +243,7 @@ def yolo_v8_m(num_classes: int = 80):
     return YOLO(width, depth, num_classes)
 
 
-def yolo_v8_l(num_classes: int = 80):
+def yolo_v8_l(num_classes: int = 2):
     depth = [3, 6, 6]
     width = [3, 64, 128, 256, 512, 512]
     return YOLO(width, depth, num_classes)

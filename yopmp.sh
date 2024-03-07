@@ -5,7 +5,7 @@
 #SBATCH --partition=SCSEGPU_UG
 #SBATCH --qos=q_ug24
 #SBATCH --nodes=1
-#SBATCH --nodelist=SCSEGPU-TC1-02
+#SBATCH --nodelist=SCSEGPU-TC1-05
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --ntasks-per-node=1

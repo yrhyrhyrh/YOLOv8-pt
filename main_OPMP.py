@@ -11,7 +11,7 @@ import yaml
 from torch.utils import data
 
 from nets import nn_OPMP
-from utils import util
+from utils import util_OPMP
 from utils.dataset import Dataset
 
 warnings.filterwarnings("ignore")
@@ -34,6 +34,7 @@ def train(args, params):
 
     p = [], [], []
     for v in model.modules():
+        # model architecture parts
         if hasattr(v, 'bias') and isinstance(v.bias, torch.nn.Parameter):
             p[2].append(v.bias)
         if isinstance(v, torch.nn.BatchNorm2d):
@@ -52,15 +53,11 @@ def train(args, params):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr, last_epoch=-1)
 
     # EMA
-    ema = util.EMA(model) if args.local_rank == 0 else None
+    ema = util_OPMP.EMA(model) if args.local_rank == 0 else None
 
     train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/train/'
     train_img_files = os.listdir(train_img_path)
-    filenames = [train_img_path + x for x in train_img_files]
-    # with open('../Dataset/COCO/train2017.txt') as reader:
-    #     for filename in reader.readlines():
-    #         filename = filename.rstrip().split('/')[-1]
-    #         filenames.append('../Dataset/COCO/images/train2017/' + filename)    
+    filenames = [train_img_path + x for x in train_img_files] 
     dataset = Dataset(filenames, args.input_size, params, True)
 
     if args.world_size <= 1:
@@ -82,7 +79,7 @@ def train(args, params):
     best = 0
     num_batch = len(loader)
     amp_scale = torch.cuda.amp.GradScaler()
-    criterion = util.ComputeLoss(model, params)
+    criterion = util_OPMP.ComputeLoss(model, params)
     num_warmup = max(round(params['warmup_epochs'] * num_batch), 1000)
     with open('weights/step.csv', 'w') as f:
         if args.local_rank == 0:
@@ -94,7 +91,7 @@ def train(args, params):
             if args.epochs - epoch == 10:
                 loader.dataset.mosaic = False
 
-            m_loss = util.AverageMeter()
+            m_loss = util_OPMP.AverageMeter()
             if args.world_size > 1:
                 sampler.set_epoch(epoch)
             p_bar = enumerate(loader)
@@ -106,8 +103,13 @@ def train(args, params):
             optimizer.zero_grad()
 
             for i, (samples, targets, _) in p_bar:
+                print('p_bar i', i)
+                print('samples size', samples.size())
+                print('targets', targets.size())
                 x = i + num_batch * epoch  # number of iterations
+                # samples: 16 images
                 samples = samples.cuda().float() / 255
+                # target boxes: tensors of [image index (0-15), class, x_center, y_center, width, height]
                 targets = targets.cuda()
 
                 # Warmup
@@ -128,6 +130,8 @@ def train(args, params):
                 # Forward
                 with torch.cuda.amp.autocast():
                     outputs = model(samples)  # forward
+                # outputs = [torch.Size([16, 65, 80, 80]), torch.Size([16, 65, 40, 40]), torch.Size([16, 65, 20, 20])]
+                # outputs is the feature info in different scales i think. 64
                 loss = criterion(outputs, targets)
 
                 m_loss.update(loss.item(), samples.size(0))
@@ -141,7 +145,7 @@ def train(args, params):
                 # Optimize
                 if x % accumulate == 0:
                     amp_scale.unscale_(optimizer)  # unscale gradients
-                    util.clip_gradients(model)  # clip gradients
+                    util_OPMP.clip_gradients(model)  # clip gradients
                     amp_scale.step(optimizer)  # optimizer.step
                     amp_scale.update()
                     optimizer.zero_grad()
@@ -182,8 +186,8 @@ def train(args, params):
                 del ckpt
 
     if args.local_rank == 0:
-        util.strip_optimizer('./weights/best.pt')  # strip optimizers
-        util.strip_optimizer('./weights/last.pt')  # strip optimizers
+        util_OPMP.strip_optimizer('./weights/best.pt')  # strip optimizers
+        util_OPMP.strip_optimizer('./weights/last.pt')  # strip optimizers
 
     torch.cuda.empty_cache()
 
@@ -232,7 +236,7 @@ def test(args, params, model=None):
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height)).cuda()  # to pixels
-        outputs = util.non_max_suppression(outputs, 0.001, 0.65)
+        outputs = util_OPMP.non_max_suppression(outputs, 0.001, 0.65)
 
         # Metrics
         for i, output in enumerate(outputs):
@@ -245,7 +249,7 @@ def test(args, params, model=None):
                 continue
 
             detections = output.clone()
-            util.scale(detections[:, :4], samples[i].shape[1:], shapes[i][0], shapes[i][1])
+            util_OPMP.scale(detections[:, :4], samples[i].shape[1:], shapes[i][0], shapes[i][1])
 
             # Evaluate
             if labels.shape[0]:
@@ -254,13 +258,13 @@ def test(args, params, model=None):
                 tbox[:, 1] = labels[:, 2] - labels[:, 4] / 2  # top left y
                 tbox[:, 2] = labels[:, 1] + labels[:, 3] / 2  # bottom right x
                 tbox[:, 3] = labels[:, 2] + labels[:, 4] / 2  # bottom right y
-                util.scale(tbox, samples[i].shape[1:], shapes[i][0], shapes[i][1])
+                util_OPMP.scale(tbox, samples[i].shape[1:], shapes[i][0], shapes[i][1])
 
                 correct = numpy.zeros((detections.shape[0], iou_v.shape[0]))
                 correct = correct.astype(bool)
 
                 t_tensor = torch.cat((labels[:, 0:1], tbox), 1)
-                iou = util.box_iou(t_tensor[:, 1:], detections[:, :4])
+                iou = util_OPMP.box_iou(t_tensor[:, 1:], detections[:, :4])
                 correct_class = t_tensor[:, 0:1] == detections[:, 5]
                 for j in range(len(iou_v)):
                     x = torch.where((iou >= iou_v[j]) & correct_class)
@@ -278,7 +282,7 @@ def test(args, params, model=None):
     # Compute metrics
     metrics = [torch.cat(x, 0).cpu().numpy() for x in zip(*metrics)]  # to numpy
     if len(metrics) and metrics[0].any():
-        tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics)
+        tp, fp, m_pre, m_rec, map50, mean_ap = util_OPMP.compute_ap(*metrics)
 
     # Print results
     print('%10.3g' * 3 % (m_pre, m_rec, mean_ap))
@@ -309,8 +313,8 @@ def main():
         if not os.path.exists('weights'):
             os.makedirs('weights')
 
-    util.setup_seed()
-    util.setup_multi_processes()
+    util_OPMP.setup_seed()
+    util_OPMP.setup_multi_processes()
 
     with open(os.path.join('utils', 'args.yaml'), errors='ignore') as f:
         params = yaml.safe_load(f)

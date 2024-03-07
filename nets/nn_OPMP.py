@@ -1,7 +1,9 @@
 import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+from utils.util import make_anchors
+
 
 def pad(k, p=None, d=1):
     if d > 1:
@@ -9,6 +11,7 @@ def pad(k, p=None, d=1):
     if p is None:
         p = k // 2
     return p
+
 
 def fuse_conv(conv, norm):
     fused_conv = torch.nn.Conv2d(conv.in_channels,
@@ -29,6 +32,7 @@ def fuse_conv(conv, norm):
 
     return fused_conv
 
+
 class Conv(torch.nn.Module):
     def __init__(self, in_ch, out_ch, k=1, s=1, p=None, d=1, g=1):
         super().__init__()
@@ -42,6 +46,7 @@ class Conv(torch.nn.Module):
     def fuse_forward(self, x):
         return self.relu(self.conv(x))
 
+
 class Residual(torch.nn.Module):
     def __init__(self, ch, add=True):
         super().__init__()
@@ -51,6 +56,7 @@ class Residual(torch.nn.Module):
 
     def forward(self, x):
         return self.res_m(x) + x if self.add_m else self.res_m(x)
+
 
 class CSP(torch.nn.Module):
     def __init__(self, in_ch, out_ch, n=1, add=True):
@@ -65,6 +71,7 @@ class CSP(torch.nn.Module):
         y.extend(m(y[-1]) for m in self.res_m)
         return self.conv3(torch.cat(y, dim=1))
 
+
 class SPP(torch.nn.Module):
     def __init__(self, in_ch, out_ch, k=5):
         super().__init__()
@@ -77,6 +84,7 @@ class SPP(torch.nn.Module):
         y1 = self.res_m(x)
         y2 = self.res_m(y1)
         return self.conv2(torch.cat([x, y1, y2, self.res_m(y2)], 1))
+
 
 class DarkNet(torch.nn.Module):
     def __init__(self, width, depth):
@@ -106,6 +114,7 @@ class DarkNet(torch.nn.Module):
         p5 = self.p5(p4)
         return p3, p4, p5
 
+
 class DarkFPN(torch.nn.Module):
     def __init__(self, width, depth):
         super().__init__()
@@ -125,7 +134,10 @@ class DarkFPN(torch.nn.Module):
         h6 = self.h6(torch.cat([self.h5(h4), p5], 1))
         return h2, h4, h6
 
+
 class DFL(torch.nn.Module):
+    # Integral module of Distribution Focal Loss (DFL)
+    # Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
     def __init__(self, ch=16):
         super().__init__()
         self.ch = ch
@@ -138,67 +150,52 @@ class DFL(torch.nn.Module):
         x = x.view(b, 4, self.ch, a).transpose(2, 1)
         return self.conv(x.softmax(1)).view(b, 4, a)
 
-class HeadOPMP(torch.nn.Module):
+
+class Head(torch.nn.Module):
     anchors = torch.empty(0)
     strides = torch.empty(0)
 
-    def __init__(self, nc=80, filters=(), num_predictions=5):
+    def __init__(self, nc=1, filters=()):
         super().__init__()
         self.ch = 16  # DFL channels
         self.nc = nc  # number of classes
+        # filters = (256, 512, 512) for yolo l, so nl = 3
         self.nl = len(filters)  # number of detection layers
-        self.no = nc + self.ch * 4  # number of outputs per anchor
-        self.num_predictions = num_predictions
+        self.no = nc + self.ch * 4  # number of outputs per anchor (1+16*4 = 65)
         self.stride = torch.zeros(self.nl)  # strides computed during build
 
         c1 = max(filters[0], self.nc)
         c2 = max((filters[0] // 4, self.ch * 4))
 
         self.dfl = DFL(self.ch)
-        self.cls = torch.nn.ModuleList(
-            torch.nn.Sequential(Conv(x, c1, 3),
-                                Conv(c1, c1, 3),
-                                torch.nn.Conv2d(c1, self.nc * num_predictions, 1)) for x in filters)
-        self.box = torch.nn.ModuleList(
-            torch.nn.Sequential(Conv(x, c2, 3),
-                                Conv(c2, c2, 3),
-                                torch.nn.Conv2d(c2, 4 * self.ch * num_predictions, 1)) for x in filters)
+        self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, c1, 3), #in=256 for x=0, in=512 for x=1,2. out=256
+                                                           Conv(c1, c1, 3), #in=256 out=256
+                                                           torch.nn.Conv2d(c1, self.nc, 1)) for x in filters) # in=256 out=1 (1 class) kernelsize=1 pointwise
+        self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, c2, 3), #in=256 for x=0, in=512 for x=1,2. out=64. kernelsize=3
+                                                           Conv(c2, c2, 3), #in=64 out=64. kernelsize=3
+                                                           torch.nn.Conv2d(c2, 4 * self.ch, 1)) for x in filters) #in=64 out=64 kernelsize=1 pointwise
 
     def forward(self, x):
-        output = []
+        print('forward head')
+        # input x is output from darknetFPN, [torch.Size([16, 256, 80, 80]), torch.Size([16, 512, 40, 40]), torch.Size([16, 512, 20, 20])]
         for i in range(self.nl):
-            box_pred = self.box[i](x[i])
-            cls_pred = self.cls[i](x[i])
-
-            # Reshape predictions for OPMP
-            box_pred = box_pred.view(box_pred.size(0), self.num_predictions, -1, box_pred.size(2), box_pred.size(3))
-            cls_pred = cls_pred.view(cls_pred.size(0), self.num_predictions, -1, cls_pred.size(2), cls_pred.size(3))
-
-            # Concatenate predictions along the prediction dimension
-            prediction = torch.cat([box_pred, cls_pred], 2)
-            output.append(prediction)
-
+            # box: i=0 torch.Size([16, 64, 80, 80]) i=1 torch.Size([16, 64, 40, 40]) i=2 torch.Size([16, 64, 20, 20])
+            # cls: i=0 torch.Size([16, 1, 80, 80]) i=1 torch.Size([16, 1, 40, 40]) i=2 torch.Size([16, 1, 20, 20])
+            x[i] = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
+        # after torch.cat: x=[torch.Size([16, 65, 80, 80]), torch.Size([16, 65, 40, 40]), torch.Size([16, 65, 20, 20])]
         if self.training:
-            return output
-        else:
-            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            return x
+        # stop here cuz training
+        print('making anchor in head')
+        self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
 
-            prediction_list = []
-            for i in range(self.num_predictions):
-                prediction_i = torch.cat([output[j][:, i, :, :, :] for j in range(self.nl)], dim=2)
-                prediction_i = prediction_i.view(prediction_i.size(0), -1, prediction_i.size(3), prediction_i.size(4))
-                prediction_list.append(prediction_i)
-
-            prediction = torch.cat(prediction_list, 1)
-
-            a, b = torch.split(self.dfl(prediction[:, :self.ch * 4, :, :]), 2, 1)
-            a = self.anchors.unsqueeze(0) - a
-            b = self.anchors.unsqueeze(0) + b
-            box = torch.cat(((a + b) / 2, b - a), 1)
-
-            cls = prediction[:, self.ch * 4:, :, :].sigmoid()
-
-            return torch.cat((box * self.strides, cls), 1)
+        x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2)
+        box, cls = x.split((self.ch * 4, self.nc), 1)
+        a, b = torch.split(self.dfl(box), 2, 1)
+        a = self.anchors.unsqueeze(0) - a
+        b = self.anchors.unsqueeze(0) + b
+        box = torch.cat(((a + b) / 2, b - a), 1)
+        return torch.cat((box * self.strides, cls.sigmoid()), 1)
 
     def initialize_biases(self):
         # Initialize biases
@@ -209,35 +206,62 @@ class HeadOPMP(torch.nn.Module):
             # cls (.01 objects, 80 classes, 640 img)
             b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
 
+
 class YOLO(torch.nn.Module):
-    def __init__(self, width, depth, num_classes, num_predictions=5):
+    def __init__(self, width, depth, num_classes):
         super().__init__()
         self.net = DarkNet(width, depth)
         self.fpn = DarkFPN(width, depth)
 
         img_dummy = torch.zeros(1, 3, 256, 256)
-        self.head = HeadOPMP(num_classes, (width[3], width[4], width[5]), num_predictions)
+        self.head = Head(num_classes, (width[3], width[4], width[5]))
         self.head.stride = torch.tensor([256 / x.shape[-2] for x in self.forward(img_dummy)])
         self.stride = self.head.stride
         self.head.initialize_biases()
 
     def forward(self, x):
+        print('forward YOLO')
         x = self.net(x)
         x = self.fpn(x)
+        print('fpn output: ', [a.size() for a in x])
         return self.head(list(x))
 
     def fuse(self):
+        print('fuse')
         for m in self.modules():
             if type(m) is Conv and hasattr(m, 'norm'):
                 m.conv = fuse_conv(m.conv, m.norm)
                 m.forward = m.fuse_forward
                 delattr(m, 'norm')
+        print('fuse return: ', self)
         return self
 
-# # Instantiate the YOLO model with OPMP
-# yolo_model = YOLO(width=[3, 80, 160, 320, 640, 640], depth=[3, 6, 6], num_classes=80, num_predictions=5)
+
+def yolo_v8_n(num_classes: int = 80):
+    depth = [1, 2, 2]
+    width = [3, 16, 32, 64, 128, 256]
+    return YOLO(width, depth, num_classes)
+
+
+def yolo_v8_s(num_classes: int = 80):
+    depth = [1, 2, 2]
+    width = [3, 32, 64, 128, 256, 512]
+    return YOLO(width, depth, num_classes)
+
+
+def yolo_v8_m(num_classes: int = 80):
+    depth = [2, 4, 4]
+    width = [3, 48, 96, 192, 384, 576]
+    return YOLO(width, depth, num_classes)
+
 
 def yolo_v8_l(num_classes: int = 2):
     depth = [3, 6, 6]
     width = [3, 64, 128, 256, 512, 512]
-    return YOLO(width, depth, num_classes, num_predictions=3)
+    return YOLO(width, depth, num_classes)
+
+
+def yolo_v8_x(num_classes: int = 80):
+    depth = [3, 6, 6]
+    width = [3, 80, 160, 320, 640, 640]
+    return YOLO(width, depth, num_classes)

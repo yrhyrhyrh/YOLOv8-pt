@@ -22,4 +22,3 @@ mix_up: 0.00000               # image mix-up (probability)
 # classes
 names:
   0: person
-  1: bg

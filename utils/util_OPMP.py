@@ -117,7 +117,7 @@ def box_iou(box1, box2):
 
     return intersection / (area1[:, None] + area2 - intersection)
 
-
+# width, height -> x, y
 def wh2xy(x):
     y = x.clone()
     y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
@@ -370,19 +370,23 @@ class ComputeLoss:
         # if no bbox
             gt = torch.zeros(pred_scores.shape[0], 0, 5, device=self.device)
         else:
-            i = targets[:, 0]  # image index
-            _, counts = i.unique(return_counts=True)
-            print('unique counts: ', counts)
-            gt = torch.zeros(pred_scores.shape[0], counts.max(), 5, device=self.device)
-            for j in range(pred_scores.shape[0]):
-                matches = i == j
-                n = matches.sum()
+            i = targets[:, 0]  # image index of targets
+            _, counts = i.unique(return_counts=True) # tensor of number of target bbox every image (index)
+            gt = torch.zeros(pred_scores.shape[0], counts.max(), 5, device=self.device) # torch.Size([16, max count, 5])
+            for j in range(pred_scores.shape[0]): # 16
+                matches = i == j  # true false tensor of size targets
+                n = matches.sum() # number of targets for image index j
                 if n:
+                    # groundtruth for image j = targets matching image id i.e. targets[1:] i.e. targets[class, x_center, y_center, width, height]
                     gt[j, :n] = targets[matches, 1:]
-            gt[..., 1:5] = wh2xy(gt[..., 1:5].mul_(size[[1, 0, 1, 0]]))
+            
+            # convert from [x_center, y_center, width, height] to [top_left_x, top_left_y, bot_right_x, bot_right_y]
+            # multiplied to become a 640*640 image
+            gt[..., 1:5] = wh2xy(gt[..., 1:5].mul_(size[[1, 0, 1, 0]])) # size[[1, 0, 1, 0]]) = tensor([640., 640., 640., 640.])
 
-        gt_labels, gt_bboxes = gt.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        gt_labels, gt_bboxes = gt.split((1, 4), 2)  # cls, xyxy # split gt into 5 chunks, 1 to cls 4 to xyxy, along dim2
+        # mask_gt creates a filter for valid gt boxes, as previously the size of list set to counts.max to accommodate image with most targets
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0) # .sum(dim=2, keepdim=True)
 
         # boxes
         b, a, c = pred_output.shape

@@ -107,8 +107,8 @@ def train(args, params):
                 print('samples size', samples.size())
                 print('targets', targets.size())
                 x = i + num_batch * epoch  # number of iterations
-                # samples: 16 images
-                samples = samples.cuda().float() / 255
+                # samples: 16 images [16, 3, 640, 640]
+                samples = samples.cuda().float() / 255 
                 # target boxes: tensors of [image index (0-15), class, x_center, y_center, width, height]
                 targets = targets.cuda()
 

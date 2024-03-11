@@ -179,10 +179,10 @@ class Head(torch.nn.Module):
         print('forward head')
         # input x is output from darknetFPN, [torch.Size([16, 256, 80, 80]), torch.Size([16, 512, 40, 40]), torch.Size([16, 512, 20, 20])]
         for i in range(self.nl):
-            # box: i=0 torch.Size([16, 64, 80, 80]) i=1 torch.Size([16, 64, 40, 40]) i=2 torch.Size([16, 64, 20, 20])
-            # cls: i=0 torch.Size([16, 1, 80, 80]) i=1 torch.Size([16, 1, 40, 40]) i=2 torch.Size([16, 1, 20, 20])
+            # box: i=0 ([16, 64, 80, 80]) i=1 ([16, 64, 40, 40]) i=2 ([16, 64, 20, 20])
+            # cls: i=0 ([16, 1, 80, 80]) i=1 ([16, 1, 40, 40]) i=2 ([16, 1, 20, 20])
             x[i] = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
-        # after torch.cat: x=[torch.Size([16, 65, 80, 80]), torch.Size([16, 65, 40, 40]), torch.Size([16, 65, 20, 20])]
+        # after torch.cat: x=[([16, 65, 80, 80]), ([16, 65, 40, 40]), ([16, 65, 20, 20])]
         if self.training:
             return x
         # stop here cuz training
@@ -222,9 +222,8 @@ class YOLO(torch.nn.Module):
     def forward(self, x):
         print('forward YOLO')
         x = self.net(x)
-        x = self.fpn(x)
-        print('fpn output: ', [a.size() for a in x])
-        return self.head(list(x))
+        x = self.fpn(x) # [([16, 256, 80, 80]), ([16, 512, 40, 40]), ([16, 512, 20, 20])]
+        return self.head(list(x)) # [([16, 65, 80, 80]), ([16, 65, 40, 40]), ([16, 65, 20, 20])]
 
     def fuse(self):
         print('fuse')

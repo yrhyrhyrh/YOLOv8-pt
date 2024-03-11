@@ -130,8 +130,8 @@ def train(args, params):
                 # Forward
                 with torch.cuda.amp.autocast():
                     outputs = model(samples)  # forward
-                # outputs = [torch.Size([16, 65, 80, 80]), torch.Size([16, 65, 40, 40]), torch.Size([16, 65, 20, 20])]
-                # outputs is the feature info in different scales i think. 64
+                # outputs = [([16, 65, 80, 80]), ([16, 65, 40, 40]), ([16, 65, 20, 20])]
+                # outputs is the feature info in different scales i think.
                 loss = criterion(outputs, targets)
 
                 m_loss.update(loss.item(), samples.size(0))

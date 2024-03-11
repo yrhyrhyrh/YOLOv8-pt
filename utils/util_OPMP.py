@@ -368,8 +368,7 @@ class ComputeLoss:
         anchor_points, stride_tensor = make_anchors(x, self.stride, 0.5)
 
         # targets
-        if targets.shape[0] == 0:
-        # if no bbox
+        if targets.shape[0] == 0:  # if no bbox
             gt = torch.zeros(pred_scores.shape[0], 0, 5, device=self.device)
         else:
             i = targets[:, 0]  # image index of targets
@@ -391,9 +390,9 @@ class ComputeLoss:
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0) # .sum(dim=2, keepdim=True)
 
         # boxes
-        b, a, c = pred_output.shape # pred_output=torch.Size([16, 8400, 64])
+        b, a, c = pred_output.shape # pred_output=torch.Size([16, 8400, 64]) # batch, anchor, channels
         pred_bboxes = pred_output.view(b, a, 4, c // 4).softmax(3) # [16, 8400, 4, 16]
-        pred_bboxes = pred_bboxes.matmul(self.project.type(pred_bboxes.dtype)) # [16, 8400, 4]
+        pred_bboxes = pred_bboxes.matmul(self.project.type(pred_bboxes.dtype)) # [16, 8400, 4] # xyxy, (b, h*w, 4) # bbox.decode()
 
         a, b = torch.split(pred_bboxes, 2, -1) # torch.Size([16, 8400, 2]) torch.Size([16, 8400, 2])
         pred_bboxes = torch.cat((anchor_points - a, anchor_points + b), -1) # torch.Size([16, 8400, 4])
@@ -452,7 +451,7 @@ class ComputeLoss:
                     torch.zeros_like(pred_scores[..., 0]).to(device),
                     torch.zeros_like(pred_scores[..., 0]).to(device))
 
-        #i:  [torch.Size([16, 64]), torch.Size([16, 64])]
+        #i:  [torch.Size([16, 64]), ([16, 64])]
         i = torch.zeros([2, self.bs, self.num_max_boxes], dtype=torch.long)
         i[0] = torch.arange(end=self.bs).view(-1, 1).repeat(1, self.num_max_boxes)
         i[1] = true_labels.long().squeeze(-1)

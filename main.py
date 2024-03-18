@@ -23,11 +23,6 @@ def learning_rate(args, params):
 
     return fn
 
-def load_ckp(checkpoint_fpath, model, optimizer):
-    checkpoint = torch.load(checkpoint_fpath)
-    model.load_state_dict(checkpoint['state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    return model, optimizer, checkpoint['epoch']
 
 def train(args, params):
     # Model
@@ -56,17 +51,16 @@ def train(args, params):
     lr = learning_rate(args, params)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr, last_epoch=-1)
 
-    start_epoch = 0
-    if args.resume_weights:
-        ckp_path = "/home/FYP/ryu007/YOLOv8-pt/weights/best.pt"
-        model, optimizer, start_epoch = load_ckp(ckp_path, model, optimizer)
-
     # EMA
     ema = util.EMA(model) if args.local_rank == 0 else None
 
     train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/train/'
     train_img_files = os.listdir(train_img_path)
-    filenames = [train_img_path + x for x in train_img_files]   
+    filenames = [train_img_path + x for x in train_img_files]
+    # with open('../Dataset/COCO/train2017.txt') as reader:
+    #     for filename in reader.readlines():
+    #         filename = filename.rstrip().split('/')[-1]
+    #         filenames.append('../Dataset/COCO/images/train2017/' + filename)    
     dataset = Dataset(filenames, args.input_size, params, True)
 
     if args.world_size <= 1:
@@ -94,7 +88,7 @@ def train(args, params):
         if args.local_rank == 0:
             writer = csv.DictWriter(f, fieldnames=['epoch', 'mAP@50', 'mAP'])
             writer.writeheader()
-        for epoch in range(start_epoch, args.epochs):
+        for epoch in range(args.epochs):
             model.train()
 
             if args.epochs - epoch == 10:
@@ -134,7 +128,7 @@ def train(args, params):
                 # Forward
                 with torch.cuda.amp.autocast():
                     outputs = model(samples)  # forward
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets) # single value tensor
 
                 m_loss.update(loss.item(), samples.size(0))
 
@@ -300,10 +294,9 @@ def main():
     parser.add_argument('--input-size', default=640, type=int)
     parser.add_argument('--batch-size', default=16, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
-    parser.add_argument('--epochs', default=60, type=int)
+    parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
-    parser.add_argument('--resume_weights', '-r', action='store_true')
     args = parser.parse_args()
 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))

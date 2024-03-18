@@ -3,13 +3,13 @@
 ##Job Script for FYP
 
 #SBATCH --partition=SCSEGPU_UG
-#SBATCH --qos=normal
+#SBATCH --qos=q_ug24
 #SBATCH --nodes=1
-#SBATCH --nodelist=SCSEGPU-TC1-04
+#SBATCH --nodelist=SCSEGPU-TC1-05
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --ntasks-per-node=1
-#SBATCH --job-name=yoloOPMP
+#SBATCH --job-name=OPMP
 #SBATCH --output=./output/output_%x_%j.out
 #SBATCH --error=./error/error_%x_%j.err
 

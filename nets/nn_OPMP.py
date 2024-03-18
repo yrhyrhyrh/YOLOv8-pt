@@ -157,44 +157,55 @@ class Head(torch.nn.Module):
 
     def __init__(self, nc=1, filters=()):
         super().__init__()
+        self.k = 2
         self.ch = 16  # DFL channels
         self.nc = nc  # number of classes
         # filters = (256, 512, 512) for yolo l, so nl = 3
         self.nl = len(filters)  # number of detection layers
-        self.no = nc + self.ch * 4  # number of outputs per anchor (1+16*4 = 65)
+        self.no = nc * self.k + self.ch * 4 * self.k  # number of outputs per anchor (1+16*4 = 65)
         self.stride = torch.zeros(self.nl)  # strides computed during build
 
-        c1 = max(filters[0], self.nc)
-        c2 = max((filters[0] // 4, self.ch * 4))
+        c1 = max(filters[0], self.nc * self.k)
+        c2 = max((filters[0] // 4, self.ch * 4 * self.k))
 
         self.dfl = DFL(self.ch)
         self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, c1, 3), #in=256 for x=0, in=512 for x=1,2. out=256
                                                            Conv(c1, c1, 3), #in=256 out=256
-                                                           torch.nn.Conv2d(c1, self.nc, 1)) for x in filters) # in=256 out=1 (1 class) kernelsize=1 pointwise
+                                                           torch.nn.Conv2d(c1, self.nc * self.k, 1)) for x in filters) # in=256 out=1 (1 class) kernelsize=1 pointwise
         self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, c2, 3), #in=256 for x=0, in=512 for x=1,2. out=64. kernelsize=3
                                                            Conv(c2, c2, 3), #in=64 out=64. kernelsize=3
-                                                           torch.nn.Conv2d(c2, 4 * self.ch, 1)) for x in filters) #in=64 out=64 kernelsize=1 pointwise
+                                                           torch.nn.Conv2d(c2, 4 * self.ch * self.k, 1)) for x in filters) #in=64 out=64 kernelsize=1 pointwise
 
     def forward(self, x):
         print('forward head')
         # input x is output from darknetFPN, [torch.Size([16, 256, 80, 80]), torch.Size([16, 512, 40, 40]), torch.Size([16, 512, 20, 20])]
         for i in range(self.nl):
-            # box: i=0 ([16, 64, 80, 80]) i=1 ([16, 64, 40, 40]) i=2 ([16, 64, 20, 20])
-            # cls: i=0 ([16, 1, 80, 80]) i=1 ([16, 1, 40, 40]) i=2 ([16, 1, 20, 20])
+            # box: i=0 ([16, 128, 80, 80]) i=1 ([16, 128, 40, 40]) i=2 ([16, 128, 20, 20])
+            # cls: i=0 ([16, 2, 80, 80]) i=1 ([16, 2, 40, 40]) i=2 ([16, 2, 20, 20])
             x[i] = torch.cat((self.box[i](x[i]), self.cls[i](x[i])), 1)
-        # after torch.cat: x=[([16, 65, 80, 80]), ([16, 65, 40, 40]), ([16, 65, 20, 20])]
+            # after torch.cat: [[8, 130, 80, 80], [8, 130, 40, 40], [8, 130, 20, 20]]
         if self.training:
             return x
         # stop here cuz training
         print('making anchor in head')
+        # [2, 8400], [1, 8400]
         self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+        print('anchrs, stride', self.anchors.size(), self.strides.size())
 
-        x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2)
-        box, cls = x.split((self.ch * 4, self.nc), 1)
+        x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2 )  # [8, 130, 8400]
+        print('x', x.size())
+        box, cls = x.split((self.ch * 4 * self.k, self.nc * self.k), 1) # [8, 128, 8400], [8, 2, 8400]
+
+        boxes = torch.split(box, 64, 1)
+        clses = torch.split(cls, 1, 1)        
         a, b = torch.split(self.dfl(box), 2, 1)
+        print('a,b before', a.size(), b.size())
         a = self.anchors.unsqueeze(0) - a
         b = self.anchors.unsqueeze(0) + b
+        print('a,b after', a.size(), b.size())
         box = torch.cat(((a + b) / 2, b - a), 1)
+        print('box', box.size())
+        print('return: ', torch.cat((box * self.strides, cls.sigmoid()), 1).size())
         return torch.cat((box * self.strides, cls.sigmoid()), 1)
 
     def initialize_biases(self):

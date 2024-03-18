@@ -55,7 +55,7 @@ def train(args, params):
     # EMA
     ema = util_OPMP.EMA(model) if args.local_rank == 0 else None
 
-    train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/train/'
+    train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data2/images/train/'
     train_img_files = os.listdir(train_img_path)
     filenames = [train_img_path + x for x in train_img_files] 
     dataset = Dataset(filenames, args.input_size, params, True)
@@ -132,6 +132,7 @@ def train(args, params):
                     outputs = model(samples)  # forward
                 # outputs = [([16, 65, 80, 80]), ([16, 65, 40, 40]), ([16, 65, 20, 20])]
                 # outputs is the feature info in different scales i think.
+                print('OUTPUTS', [x.size() for x in outputs])
                 loss = criterion(outputs, targets)
 
                 m_loss.update(loss.item(), samples.size(0))
@@ -200,7 +201,7 @@ def test(args, params, model=None):
     #         filename = filename.rstrip().split('/')[-1]
     #         filenames.append('../Dataset/COCO/images/val2017/' + filename)
 
-    val_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/val/'
+    val_img_path = '/home/FYP/ryu007/YOLOv8-pt/data2/images/val/'
     val_img_files = os.listdir(val_img_path)
     filenames = [val_img_path + x for x in val_img_files]   
 

@@ -202,7 +202,7 @@ def test(args, params, model=None):
 
     dataset = Dataset(filenames, args.input_size, params, False)
     # changed val batch size from 8 to 32.
-    loader = data.DataLoader(dataset, 32, False, num_workers=8,
+    loader = data.DataLoader(dataset, 8, False, num_workers=8,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if model is None:
@@ -227,18 +227,21 @@ def test(args, params, model=None):
         samples = samples.half()  # uint8 to fp16/32
         samples = samples / 255  # 0 - 255 to 0.0 - 1.0
         _, _, height, width = samples.shape  # batch size, channels, height, width
+        print('samples', samples.shape) # [32, 3, 640, 640]
+        print('targets', targets.shape) # [x, 6]
+        print('shapes', shapes) # [32, 3, 2] in list form
 
         # Inference
-        outputs = model(samples)
+        outputs = model(samples) # [32, 5, 8400]
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height)).cuda()  # to pixels
-        outputs = util.non_max_suppression(outputs, 0.001, 0.65)
+        outputs = util.non_max_suppression(outputs, 0.001, 0.65) # length = 32, contains tensors of size (a, 6)
 
         # Metrics
         for i, output in enumerate(outputs):
-            labels = targets[targets[:, 0] == i, 1:]
-            correct = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
+            labels = targets[targets[:, 0] == i, 1:] # varying q, [q, 5]
+            correct = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda() # varying r, [r, 10]
 
             if output.shape[0] == 0:
                 if labels.shape[0]:

@@ -193,20 +193,32 @@ class Head(torch.nn.Module):
         print('anchrs, stride', self.anchors.size(), self.strides.size())
 
         x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2 )  # [8, 130, 8400]
-        print('x', x.size())
         box, cls = x.split((self.ch * 4 * self.k, self.nc * self.k), 1) # [8, 128, 8400], [8, 2, 8400]
 
-        boxes = torch.split(box, 64, 1)
-        clses = torch.split(cls, 1, 1)        
-        a, b = torch.split(self.dfl(box), 2, 1)
-        print('a,b before', a.size(), b.size())
-        a = self.anchors.unsqueeze(0) - a
-        b = self.anchors.unsqueeze(0) + b
-        print('a,b after', a.size(), b.size())
-        box = torch.cat(((a + b) / 2, b - a), 1)
-        print('box', box.size())
-        print('return: ', torch.cat((box * self.strides, cls.sigmoid()), 1).size())
-        return torch.cat((box * self.strides, cls.sigmoid()), 1)
+        box0, box1 = torch.split(box, 64, 1)
+        cls0, cls1 = torch.split(cls, 1, 1)     
+
+        a0, b0 = torch.split(self.dfl(box0), 2, 1)
+        a1, b1 = torch.split(self.dfl(box1), 2, 1)
+        # a, b = torch.split(self.dfl(box), 2, 1)
+        a0 = self.anchors.unsqueeze(0) - a0
+        a1 = self.anchors.unsqueeze(0) - a1
+        # a = self.anchors.unsqueeze(0) - a
+
+        b0 = self.anchors.unsqueeze(0) + b0
+        b1 = self.anchors.unsqueeze(0) + b1
+        # b = self.anchors.unsqueeze(0) + b
+        print('a,b after', a0.size(), b0.size())
+
+        box0 = torch.cat(((a0 + b0) / 2, b0 - a0), 1)
+        box1 = torch.cat(((a1 + b1) / 2, b1 - a1), 1)
+        # box = torch.cat(((a + b) / 2, b - a), 1)
+        print('box', box0.size())
+
+        output0 = torch.cat((box0 * self.strides, cls0.sigmoid()), 1).unsqueeze(1)
+        output1 = torch.cat((box1 * self.strides, cls1.sigmoid()), 1).unsqueeze(1)
+        print('output size: ', torch.cat((output0, output1), 1).size())
+        return torch.cat((output0, output1), 1)
 
     def initialize_biases(self):
         # Initialize biases

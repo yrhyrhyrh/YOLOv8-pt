@@ -55,7 +55,7 @@ def train(args, params):
     # EMA
     ema = util_OPMP.EMA(model) if args.local_rank == 0 else None
 
-    train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data2/images/train/'
+    train_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/train/'
     train_img_files = os.listdir(train_img_path)
     filenames = [train_img_path + x for x in train_img_files] 
     dataset = Dataset(filenames, args.input_size, params, True)
@@ -201,7 +201,7 @@ def test(args, params, model=None):
     #         filename = filename.rstrip().split('/')[-1]
     #         filenames.append('../Dataset/COCO/images/val2017/' + filename)
 
-    val_img_path = '/home/FYP/ryu007/YOLOv8-pt/data2/images/val/'
+    val_img_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/val/'
     val_img_files = os.listdir(val_img_path)
     filenames = [val_img_path + x for x in val_img_files]   
 
@@ -231,18 +231,26 @@ def test(args, params, model=None):
         samples = samples.half()  # uint8 to fp16/32
         samples = samples / 255  # 0 - 255 to 0.0 - 1.0
         _, _, height, width = samples.shape  # batch size, channels, height, width
+        print('samples', samples.size()) # [8, 3, 640, 640]
+        print('targets', targets.size()) # [192, 6]
+        print('shapes', shapes) # [8,3,2] in list form
 
         # Inference
-        outputs = model(samples)
+        outputs = model(samples) # [8, 2, 5, 8400]
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height)).cuda()  # to pixels
-        outputs = util_OPMP.non_max_suppression(outputs, 0.001, 0.65)
+        outputs = util_OPMP.set_non_max_suppression(outputs, 0.001, 0.65)
+        print('targets', targets.size())
+        print('outputs length', len(outputs)) 
+        print('outputs', [x.size() for x in outputs])
 
         # Metrics
         for i, output in enumerate(outputs):
             labels = targets[targets[:, 0] == i, 1:]
+            print('labels', labels.size())
             correct = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
+            print('correct', correct.size())
 
             if output.shape[0] == 0:
                 if labels.shape[0]:
@@ -296,7 +304,7 @@ def test(args, params, model=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
-    parser.add_argument('--batch-size', default=16, type=int)
+    parser.add_argument('--batch-size', default=8, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--train', action='store_true')

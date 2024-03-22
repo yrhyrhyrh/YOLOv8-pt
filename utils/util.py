@@ -174,6 +174,51 @@ def non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
 
     return outputs
 
+def set_non_max_suppression(prediction, conf_threshold=0.25, iou_threshold=0.45):
+    nc = prediction.shape[2] - 4  # number of classes
+    max_wh = 7680  # (pixels) maximum box width and height
+    max_det = 300  # the maximum number of boxes to keep after NMS
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+
+    start = time.time()
+    outputs = [torch.zeros((0, 6), device=prediction.device)] * prediction.shape[0]
+    for index, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        x = x.view(-1, 5 + nc)
+        xc = x[:, 4:4 + nc].amax(1) > conf_threshold  # candidates
+        x = x[xc]
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Detections matrix nx6 (box, conf, cls)
+        box, cls = x.split((4, nc), 1)
+        # center_x, center_y, width, height) to (x1, y1, x2, y2)
+        box = wh2xy(box)
+        if nc > 1:
+            i, j = (cls > conf_threshold).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float()), 1)
+        else:  # best class only
+            conf, j = cls.max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_threshold]
+        # Check shape
+        if not x.shape[0]:  # no boxes
+            continue
+
+        # Batched Set NMS
+        c = x[:, 5:6] * max_wh  # classes
+        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        keep = set_cpu_nms(torch.cat((boxes, scores[:, None]), 1), iou_threshold)
+        keep = keep[:max_det]  # limit detections
+        outputs[index] = x[keep]
+
+        if (time.time() - start) > 0.5 + 0.05 * prediction.shape[0]:
+            print(f'WARNING ⚠️ NMS time limit {0.5 + 0.05 * prediction.shape[0]:.3f}s exceeded')
+            break  # time limit exceeded
+
+    return outputs
+
 
 def smooth(y, f=0.05):
     # Box filter of fraction f
@@ -351,8 +396,8 @@ class ComputeLoss:
         pred_output, pred_scores = output.split((4 * self.dfl_ch, self.nc), 1)
 
         # swap dim 1 and 2 -> pred_output=torch.Size([16, 8400, 64]), pred_scores=torch.Size([16, 8400, 1])
-        pred_output = pred_output.permute(0, 2, 1).contiguous()
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_output = pred_output.permute(0, 2, 1).contiguous() # [16, 8400, 64]
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous() # [16, 8400, 1]
 
         # size = tensor([80., 80.])
         size = torch.tensor(x[0].shape[2:], dtype=pred_scores.dtype, device=self.device)
@@ -408,6 +453,7 @@ class ComputeLoss:
         target_scores_sum = target_scores.sum() # tensor(722.0627)
 
         # cls loss
+        # pred score [16, 8400, 1] target score [16, 8400, 1]
         loss_cls = self.bce(pred_scores, target_scores.to(pred_scores.dtype)) # torch.Size([16, 8400, 1])
         loss_cls = loss_cls.sum() / target_scores_sum # tensor(7.2681)
 
@@ -419,9 +465,21 @@ class ComputeLoss:
             # target_scores.sum(-1): sum along last dim (-1)
             # masked_select: apply fg_mask, result in 1 dimension vector of size x
             # unsqueeze(-1): add a dimension at the last index, i.e. row -> column
+            '''
+            target_scores: [16, 8400, 1]
+            fg_mask: [16, 8400]
+            pred_bboxes: [16, 8400, 4]
+            target_bboxes: [16, 8400, 4]
+            '''
             weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1) # [x, 1]
+            
             loss_box = self.iou(pred_bboxes[fg_mask], target_bboxes[fg_mask]) # [x, 1]
+
+            print('((1.0 - loss_box0) * weight0),', ((1.0 - loss_box) * weight).size())
+            print('sum', ((1.0 - loss_box) * weight).sum().size())
+            print('target_scores_sum[0].reshape(1)',target_scores_sum.size())
             loss_box = ((1.0 - loss_box) * weight).sum() / target_scores_sum # tensor(0.6298)
+            print('lossbox', loss_box.size())
             # DFL loss
             a, b = torch.split(target_bboxes, 2, -1) # [16, 8400, 2]
             target_lt_rb = torch.cat((anchor_points - a, b - anchor_points), -1)
@@ -438,7 +496,18 @@ class ComputeLoss:
     def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes, true_mask, anchors):
         """
         Task-aligned One-stage Object Detection assigner
+        
+        assigns ground-truth (gt) objects to anchors based on the task-aligned metric, which combines both
+        classification and localization information.
+
+        pred_scores: [16, 8400, 1]
+        pred_bboxes: [16, 8400, 4]
+        true labels: [16, max count, 1]
+        true_bboxes: [16, max count, 4]
+        true_mask: [16, max count, 1])
+        anchors: [8400, 2]
         """
+        print('true mask', true_mask)
         self.bs = pred_scores.size(0) # 16
         self.num_max_boxes = true_bboxes.size(1) # 64
 
@@ -456,12 +525,14 @@ class ComputeLoss:
         i[1] = true_labels.long().squeeze(-1)
 
         # true_bboxes.unsqueeze(2) = [16, maxtargets, 1, 4], pred_bboxes.unsqueeze(1) = [16, 1, 8400, 4]
+        # for each gt, the iou between each 
         overlaps = self.iou(true_bboxes.unsqueeze(2), pred_bboxes.unsqueeze(1)) # [16, 64, 8400, 1]
         overlaps = overlaps.squeeze(3).clamp(0) # [16, 64, 8400])
         print('iou', overlaps.size())
         print('iou', overlaps)
         # pred_scores[i[0], :, i[1]] = bbox scores = Get the scores of each grid for each gt cls # size = [16, maxtargets, 8400]
         align_metric = pred_scores[i[0], :, i[1]].pow(self.alpha) * overlaps.pow(self.beta) # [16, 64, 8400]
+
         bs, n_boxes, _ = true_bboxes.shape # 16, 64
         lt, rb = true_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom # ([1024, 1, 2]) ([1024, 1, 2])
         bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2) # [1024, 8400, 4]
@@ -474,8 +545,11 @@ class ComputeLoss:
             top_k_mask = (top_k_metrics.max(-1, keepdim=True) > self.eps).tile([1, 1, self.top_k])
         top_k_indices = torch.where(top_k_mask, top_k_indices, 0) # [16, 64, 10]
         is_in_top_k = one_hot(top_k_indices, num_anchors).sum(-2) # [16, 64, 8400]
+        print('onehot', one_hot(top_k_indices, num_anchors))
+        print('isinonehot', is_in_top_k)
         # filter invalid boxes
         is_in_top_k = torch.where(is_in_top_k > 1, 0, is_in_top_k) # [16, 64, 8400]
+        print('isintopk', is_in_top_k)
         mask_top_k = is_in_top_k.to(metrics.dtype) # [16, 64, 8400]
         # merge all mask to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_top_k * mask_in_gts * true_mask # [16, 64, 8400]
@@ -490,6 +564,7 @@ class ComputeLoss:
             max_overlaps_idx = overlaps.argmax(1) # [16, 8400] # for each image, each anchor uses which target(idx)
             print('overlaps', overlaps)
             print('max overlaps idx', max_overlaps_idx)
+            # which target(idx) is highest overlap for each anchor point
             is_max_overlaps = one_hot(max_overlaps_idx, self.num_max_boxes) # [16, 8400, 99]
             print('ismaxovevrlaps', is_max_overlaps.size())
             is_max_overlaps = is_max_overlaps.permute(0, 2, 1).to(overlaps.dtype) # [16, 99, 8400]
@@ -505,7 +580,10 @@ class ComputeLoss:
                                    dtype=torch.int64,
                                    device=true_labels.device)[..., None]  # [16, 1]
         target_gt_idx = target_gt_idx + batch_index * self.num_max_boxes # [16, 8400]
+        print('max,', torch.max(target_gt_idx,1 , keepdim=True))
         target_labels = true_labels.long().flatten()[target_gt_idx] # [16, 8400]
+        print('true lbels', true_labels)
+        print('target labels', target_labels)
 
         # assigned target boxes
         target_bboxes = true_bboxes.view(-1, 4)[target_gt_idx]
@@ -541,16 +619,17 @@ class ComputeLoss:
 
     @staticmethod
     def iou(box1, box2, eps=1e-7): # DIoU + aspect ratio
+        # true_bboxes.unsqueeze(2) = [16, maxtargets, 1, 4], pred_bboxes.unsqueeze(1) = [16, 1, 8400, 4]
         # Returns Intersection over Union (IoU) of box1(1,4) to box2(n,4)
 
         # Get the coordinates of bounding boxes
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1) # [16, 135, 1, 1]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1) # [16, 1, 8400, 1]
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps  # [16, 135, 1, 1]
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps # [16, 1, 8400, 1]
+        
         # Intersection area
-        area1 = b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)
+        area1 = b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1) # [16, 135, 8400, 1]
         area2 = b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
         intersection = area1.clamp(0) * area2.clamp(0)
 

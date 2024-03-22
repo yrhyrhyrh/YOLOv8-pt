@@ -385,17 +385,18 @@ class ComputeLoss:
         # OPMP: x = [torch.Size([16, 130, 80, 80]), torch.Size([16, 130, 40, 40]), torch.Size([16, 130, 20, 20])]
         x = outputs[1] if isinstance(outputs, tuple) else outputs
 
-        # .shape = .size
-        # x[0].shape[0]=16
-        # self.no=outputs per anchor=65
-        # output = cat([16, 65, 80*80], [16, 65, 40*40], [16, 65, 20*20]) = [16, 65, 8400]
         output = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2) # OPMP: [16, 130, 8400]
 
-        # split output into 4*16=64 and 1, using dimension 1 (65)
-        pred_output, pred_scores = output.split((self.k * 4 * self.dfl_ch, self.nc * self.k), 1)
-        # swap dim 1 and 2 -> pred_output=torch.Size([16, 8400, 64]), pred_scores=torch.Size([16, 8400, 1])
-        pred_output = pred_output.permute(0, 2, 1).contiguous() # OPMP: [16, 8400, 128]
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous() # OPMP: [16, 8400, 2]
+        pred_output, pred_scores = output.split((4 * self.dfl_ch * self.k, self.nc * self.k), 1) # [16, 128, 8400] [16, 2, 8400]
+
+        pred_output_list = list(pred_output.split(4 * self.dfl_ch, 1))
+        pred_output_list = [x.permute(0, 2, 1).contiguous() for x in pred_output_list]
+
+        pred_scores_list = list(pred_scores.split(1, 1))
+        pred_scores_list = [x.permute(0, 2, 1).contiguous() for x in pred_scores_list]
+
+        print('pred output list', [x.size() for x in pred_output_list])
+        print('pred scores list', [x.size() for x in pred_scores_list])
 
         # size = tensor([80., 80.])
         size = torch.tensor(x[0].shape[2:], dtype=pred_scores.dtype, device=self.device)
@@ -410,14 +411,14 @@ class ComputeLoss:
         # stride tensor = [torch.Size([6400, 1]), torch.Size([1600, 1]), torch.Size([400, 1])] #column tensor for the respective strides of anchor 
         anchor_points, stride_tensor = make_anchors(x, self.stride, 0.5) # [8400, 2], [8400, 1]
 
-        # targets
+        # targets [x, 6]: (image index (0-15), class, x_center, y_center, width, height)
         if targets.shape[0] == 0:  # if no bbox
             gt = torch.zeros(pred_scores.shape[0], 0, 5, device=self.device)
         else:
             i = targets[:, 0]  # image index of targets
             _, counts = i.unique(return_counts=True) # tensor of number of target bbox every image (index)
             gt = torch.zeros(pred_scores.shape[0], counts.max(), 5, device=self.device) # torch.Size([16, max count, 5])
-            for j in range(pred_scores.shape[0]): # 16
+            for j in range(pred_scores.shape[0]): # 16 (for each image)
                 matches = i == j  # true false tensor of size targets
                 n = matches.sum() # number of targets for image index j
                 if n:
@@ -433,41 +434,60 @@ class ComputeLoss:
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0) # .sum(dim=2, keepdim=True)
 
         # boxes
-        b, a, c = pred_output.shape # pred_output=torch.Size([16, 8400, 128]) # batch, anchor, channels
-        pred_bboxes = pred_output.view(b, a, 4 * self.k, c // 4 // self.k).softmax(3) # [16, 8400, 4, 16]
-        pred_bboxes = pred_bboxes.matmul(self.project.type(pred_bboxes.dtype)) # [16, 8400, 4] # xyxy, (b, h*w, 4) # OPMP: [16, 8400, 8]
+        pred_bboxes_list = []
+        for pred_output in pred_output_list:
+            b, a, c = pred_output.shape # pred_output=torch.Size([16, 8400, 128]) # batch, anchor, channels
 
-        a, b, c, d = torch.split(pred_bboxes, 2, -1) # torch.Size([16, 8400, 2]) torch.Size([16, 8400, 2])
-        pred_bboxes = torch.cat((anchor_points - a, anchor_points + b, anchor_points - c, anchor_points + d), -1) # torch.Size([16, 8400, 4]) # scale it to image size
+            pred_bboxes = pred_output.view(b, a, 4, c // 4).softmax(3) # [16, 8400, 4, 16]
+            pred_bboxes = pred_bboxes.matmul(self.project.type(pred_bboxes.dtype)) # [16, 8400, 4] # xyxy, (b, h*w, 4) # OPMP: [16, 8400, 8]
 
-        scores = pred_scores.detach().sigmoid() # [16, 8400, 1] # OPMP: [16, 8400, 2] shape(bs, num_total_anchors, num_classes)
-        bboxes = (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype) # multiply pred box w stride [16, 8400, 4] -> [16, 8400, 4] # OPMP: [16, 8400, 8]
+            a, b = torch.split(pred_bboxes, 2, -1) # torch.Size([16, 8400, 2]) torch.Size([16, 8400, 2])
+            pred_bboxes = torch.cat((anchor_points - a, anchor_points + b), -1) # torch.Size([16, 8400, 4]) # scale it to image size
+            pred_bboxes_list.append(pred_bboxes)
 
+        scores = []
+        bboxes = []
+        for i in range(self.k):
+            score = pred_scores_list[i].detach().sigmoid() # [16, 8400, 1] # OPMP: [16, 8400, 2] shape(bs, num_total_anchors, num_classes)
+            bbox = (pred_bboxes_list[i].detach() * stride_tensor).type(gt_bboxes.dtype) # multiply pred box w stride [16, 8400, 4] -> [16, 8400, 4] # OPMP: [16, 8400, 8]
+            scores.append(score)
+            bboxes.append(bbox)
+
+        # scores = torch.cat(scores, dim=-1) # [8, 8400, 2]
+        # bboxes = torch.cat(bboxes, dim=-1) # [8, 8400, 8]
 
         '''
         target_bboxes: [16, 8400, 2, 4]
         target_scores: [16, 8400, 2, 1]
         fg_mask: [16, 8400, 2]
         '''
-        # # [16, 8400, 4], [16, 8400, 1], [16, 8400]
-        target_bboxes, target_scores, fg_mask = self.assign(scores, bboxes,
-                                                            gt_labels, gt_bboxes, mask_gt,
-                                                            anchor_points * stride_tensor) # TOOD
+        target_bboxes_list = []
+        target_scores_list = []
+        fg_mask_list = []
+        for i in range(self.k):
+            # [16, 8400, 4], [16, 8400, 1], [16, 8400]
+            target_bboxes, target_scores, fg_mask = self.assign(scores[i], bboxes[i],
+                                                                gt_labels, gt_bboxes, mask_gt,
+                                                                anchor_points * stride_tensor) # TOOD
+            target_bboxes_list.append(target_bboxes)
+            target_scores_list.append(target_scores)
+            fg_mask_list.append(fg_mask)
+       
         '''
         targets already assigned using algin metrics with pred scores, may not need permutation with targets
+        target_scores_list: list of tensors size[16, 8400, 1]
         '''
+        # target_bboxes_list = list(target_bboxes.split(1, -2))
+        # target_bboxes_list = [x.squeeze(-2) for x in target_bboxes_list]
+        # target_bboxes_list = [x / stride_tensor for x in target_bboxes_list]
         
-        '''
-        target_bboxes /= stride_tensor.unsqueeze(-1) -> [16, 8400, 2, 4]
-        target_scores_sum0 = target_scores[:,:,0:1,:].sum().reshape(1)
-        target_scores_sum1 = target_scores[:,:,1:2,:].sum().reshape(1)
-        target_scores_sum = torch.cat(target_scores_sum0, target_scores_sum1) -> tensor(a, b)
-        '''
-        target_bboxes /= stride_tensor.unsqueeze(-1) # [16, 8400, 4])
-        target_scores_sum0 = target_scores[:,:,0:1,:].sum().reshape(1)
-        target_scores_sum1 = target_scores[:,:,1:2,:].sum().reshape(1)
-        target_scores_sum = torch.cat((target_scores_sum0, target_scores_sum1), dim=0)
-        # target_scores_sum = target_scores.sum() # tensor(722.0627)
+        # target_scores_list = list(target_scores.split(1, -2))
+        # target_scores_list = [x.squeeze(-2) for x in target_scores_list]
+        target_scores_sum = torch.cat([x.sum().reshape(1) for x in target_scores_list], dim=0)
+        print('target_score_sum', target_scores_sum)
+
+        # fg_mask_list = fg_mask.split(1, -1)
+        # fg_mask_list = [x.squeeze() for x in fg_mask_list]
 
         '''
         scrap permutations
@@ -481,91 +501,63 @@ class ComputeLoss:
         loss_cls: tensor(a, b)
         '''
         # cls loss
-        loss_cls = self.bce(pred_scores.unsqueeze(-1), target_scores.to(pred_scores.dtype)) # torch.Size([16, 8400, 1])
-        loss_cls0 = loss_cls[:, :, 0:1, :].sum().reshape(1)
-        loss_cls1 = loss_cls[:, :, 1:2, :].sum().reshape(1) #alw inf, maybe cuz of predscores shape
-        loss_cls = torch.cat((loss_cls0, loss_cls1), dim=0) / target_scores_sum
+        loss_cls_list = []
+        for i, pred_scores in enumerate(pred_scores_list):
+            loss_cls = self.bce(pred_scores, target_scores_list[i].to(pred_scores.dtype))
+            print('loss cls', i, loss_cls)
+            print('sum', loss_cls.sum())
+            loss_cls_list.append(loss_cls)
+
+        loss_cls_list = [x.sum().reshape(1) for x in loss_cls_list]
+        loss_cls = torch.cat(loss_cls_list, dim=0) / target_scores_sum
+
         print('losscls', loss_cls)
 
         # loss_cls = loss_cls.sum() / target_scores_sum # tensor(7.2681)
 
-        # box loss
-        loss_box = torch.zeros(2, device=self.device) # initialize torch.Size([1])
-        loss_dfl = torch.zeros(2, device=self.device) # initialize torch.Size([1])
-        if fg_mask.sum():
-            '''
-            target_scores: [16, 8400, 2, 1]
-            fg_mask: [16, 8400, 2]
+        loss_dfl_list = []
+        loss_box_list = []
+        for i, fg_mask in enumerate(fg_mask_list):
+            # box loss
+            loss_box = torch.zeros(1, device=self.device) # initialize torch.Size([1])
+            loss_dfl = torch.zeros(1, device=self.device) # initialize torch.Size([1])
+            if fg_mask.sum():
+                '''
+                target_scores: [16, 8400, 2, 1]
+                fg_mask: [16, 8400, 2]
 
-            pred_bboxes: [16, 8400, 8]
-            target_bboxes: [16, 8400, 2, 4]
-            pred_output: [16, 8400, 128]
-            '''
+                pred_bboxes: [16, 8400, 8]
+                target_bboxes: [16, 8400, 2, 4]
+                pred_output: [16, 8400, 128]
+                '''
 
-            target_scores0, target_scores1 = torch.split(target_scores, 1, -2) # [16, 8400, 1, 1]
-            target_scores0 = target_scores0.squeeze(-2) # [16, 8400, 1]
-            target_scores1 = target_scores1.squeeze(-2)
+                # IoU loss
+                # masked_select: apply fg_mask, result in 1 dimension vector of size x            
+                weight = torch.masked_select(target_scores_list[i].sum(-1), fg_mask).unsqueeze(-1) # [x, 1]
+                
+                loss_box = self.iou(pred_bboxes_list[i][fg_mask], target_bboxes_list[i][fg_mask]) # [x, 1]
+                loss_box = ((1.0 - loss_box) * weight).sum() / target_scores_sum[i]
+                loss_box_list.append(loss_box)
 
-            fg_mask0, fg_mask1 = torch.split(fg_mask, 1, -1) # [16, 8400, 1]
-            fg_mask0 = fg_mask0.squeeze() # [16, 8400]
-            fg_mask1 = fg_mask1.squeeze()
-            # IoU loss
-            # masked_select: apply fg_mask, result in 1 dimension vector of size x
+                # DFL loss
+                a, b = torch.split(target_bboxes_list[i], 2, -1)
+                target_lt_rb = torch.cat((anchor_points - a, b - anchor_points), -1)
+                target_lt_rb = target_lt_rb.clamp(0, self.dfl_ch - 1.01)  # distance (left_top, right_bottom)
+                loss_dfl = self.df_loss(pred_output_list[i][fg_mask].view(-1, self.dfl_ch), target_lt_rb[fg_mask])
+                loss_dfl = (loss_dfl * weight).sum() / target_scores_sum[i]
+                loss_dfl_list.append(loss_dfl)
 
-            weight0 = torch.masked_select(target_scores0.sum(-1), fg_mask0).unsqueeze(-1)
-            weight1 = torch.masked_select(target_scores1.sum(-1), fg_mask1).unsqueeze(-1)
-            print('weight', weight0.size())
-            # weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1) # [x, 1]
-            
-            pred_bboxes0, pred_bboxes1 = torch.split(pred_bboxes, 4, -1) # [16, 8400, 4]
-            target_bboxes0, target_bboxes1 = torch.split(target_bboxes, 1, -2)
-            target_bboxes0 = target_bboxes0.squeeze(-2)
-            target_bboxes1 = target_bboxes1.squeeze(-2)
-            print('target bbox', target_bboxes1.size())
 
-            loss_box0 = self.iou(pred_bboxes0[fg_mask0], target_bboxes0[fg_mask0])
-            loss_box0 = ((1.0 - loss_box0) * weight0).sum() / target_scores_sum[0]
-            loss_box1 = self.iou(pred_bboxes1[fg_mask1], target_bboxes1[fg_mask1])
-            loss_box1 = ((1.0 - loss_box1) * weight1).sum() / target_scores_sum[1]
+        loss_cls_list = [x * self.params['cls'] for x in loss_cls_list]
+        loss_box_list = [x * self.params['box'] for x in loss_box_list]
+        loss_dfl_list = [x * self.params['dfl'] for x in loss_dfl_list]
+
+        loss_list = []
+        for i in range(self.k):
+            loss_list.append(loss_cls_list[i] + loss_box_list[i] + loss_dfl_list[i])
         
-            # loss_box = self.iou(pred_bboxes[fg_mask], target_bboxes[fg_mask]) # [x, 1]
-            # loss_box = ((1.0 - loss_box) * weight).sum() / target_scores_sum # tensor(0.6298)
-            
-            # DFL loss
-            a0, b0 = torch.split(target_bboxes0, 2, -1)
-            a1, b1 = torch.split(target_bboxes1, 2, -1) # [16, 8400, 2]
-
-            target_lt_rb0 = torch.cat((anchor_points - a0, b0 - anchor_points), -1)
-            target_lt_rb1 = torch.cat((anchor_points - a1, b1 - anchor_points), -1)
-            # target_lt_rb = torch.cat((anchor_points - a, b - anchor_points), -1)
-            target_lt_rb0 = target_lt_rb0.clamp(0, self.dfl_ch - 1.01)
-            target_lt_rb1 = target_lt_rb1.clamp(0, self.dfl_ch - 1.01)
-            #target_lt_rb = target_lt_rb.clamp(0, self.dfl_ch - 1.01)  # distance (left_top, right_bottom)
-            
-            '''
-            fg_mask: [16, 8400, 2]
-            pred_output: [16, 8400, 128]
-            '''
-            pred_output0, pred_output1 = torch.split(pred_output, 64, -1)
-            loss_dfl0 = self.df_loss(pred_output0[fg_mask0].view(-1, self.dfl_ch), target_lt_rb0[fg_mask0])
-            loss_dfl1 = self.df_loss(pred_output1[fg_mask1].view(-1, self.dfl_ch), target_lt_rb1[fg_mask1])
-            # loss_dfl = self.df_loss(pred_output[fg_mask].view(-1, self.dfl_ch), target_lt_rb[fg_mask])
-            loss_dfl0 = (loss_dfl0 * weight0).sum() / target_scores_sum[0]
-            loss_dfl1 = (loss_dfl1 * weight1).sum() / target_scores_sum[1] 
-            # loss_dfl = (loss_dfl * weight).sum() / target_scores_sum
-
-        loss_cls0 *= self.params['cls']
-        loss_cls1 *= self.params['cls']
-        loss_box0 *= self.params['box']
-        loss_box1 *= self.params['box']
-        loss_dfl0 *= self.params['dfl']
-        loss_dfl1 *= self.params['dfl']
-
-        loss0 = loss_cls0 + loss_box0 + loss_dfl0
-        loss1 = loss_cls1 + loss_box1 + loss_dfl1
-        
-        print(min(loss0, loss1))
-        return min(loss0, loss1)  # loss(cls, box, dfl)
+        print('loss list', loss_list)
+        return sum(loss_list)  # loss(cls, box, dfl)
 
     @torch.no_grad()
     def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes, true_mask, anchors):
@@ -575,18 +567,16 @@ class ComputeLoss:
         assigns ground-truth (gt) objects to anchors based on the task-aligned metric, which combines both
         classification and localization information.
 
-        pred_scores: [16, 8400, 1] -> [16, 8400, 2]
-        pred_bboxes: [16, 8400, 4] -> [16, 8400, 8]
-        true_labels: [16, max count, 1]
+        pred_scores: [16, 8400, 1]
+        pred_bboxes: [16, 8400, 4]
+        true labels: [16, max count, 1]
         true_bboxes: [16, max count, 4]
-        true_mask: [16, max count, 1] (true for indices where there is a valid gt)
+        true_mask: [16, max count, 1])
         anchors: [8400, 2]
         """
+        print('true mask', true_mask)
         self.bs = pred_scores.size(0) # 16
         self.num_max_boxes = true_bboxes.size(1) # 64
-
-        print('true_mask', true_mask.size())
-        print('anchors', anchors.size())
 
         if self.num_max_boxes == 0:
             device = true_bboxes.device
@@ -601,221 +591,15 @@ class ComputeLoss:
         i[0] = torch.arange(end=self.bs).view(-1, 1).repeat(1, self.num_max_boxes)
         i[1] = true_labels.long().squeeze(-1)
 
-        '''
-        target overlaps: [16,64,8400,2] (ious for 2 preds)
-        '''
-        overlap0 = self.iou(true_bboxes.unsqueeze(2), pred_bboxes[...,0:4].unsqueeze(1))
-        overlap1 = self.iou(true_bboxes.unsqueeze(2), pred_bboxes[...,4:8].unsqueeze(1))
-        overlaps = torch.cat((overlap0, overlap1), dim=-1)
-        # overlaps = self.iou(true_bboxes.unsqueeze(2), pred_bboxes.unsqueeze(1)) # [16, 64, 8400, 1] 
+        # true_bboxes.unsqueeze(2) = [16, maxtargets, 1, 4], pred_bboxes.unsqueeze(1) = [16, 1, 8400, 4]
+        # for each gt, the iou between each 
+        overlaps = self.iou(true_bboxes.unsqueeze(2), pred_bboxes.unsqueeze(1)) # [16, 64, 8400, 1]
         overlaps = overlaps.squeeze(3).clamp(0) # [16, 64, 8400])
-        # pred_scores[i[0], :, i[1]] = bbox scores = Get the scores of each grid for each gt cls # size = [16, maxtargets, 8400]
-        '''
-        target align_metrics: [16,64,8400,2] (metric for 2 pred scores)
-        '''
-        align_metric0 = pred_scores[...,0:1][i[0], :, i[1]].pow(self.alpha) * overlaps[...,0:1].squeeze(-1).pow(self.beta)
-        align_metric1 = pred_scores[...,1:2][i[0], :, i[1]].pow(self.alpha) * overlaps[...,1:2].squeeze(-1).pow(self.beta)
-        align_metric = torch.cat((align_metric0.unsqueeze(-1), align_metric1.unsqueeze(-1)), dim=-1)
-        # align_metric = pred_scores[i[0], :, i[1]].pow(self.alpha) * overlaps.pow(self.beta) # [16, 64, 8400]
-        
-        bs, n_boxes, _ = true_bboxes.shape # 16, 64
-        lt, rb = true_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom # ([1024, 1, 2]) ([1024, 1, 2])
-        bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2) # [1024, 8400, 4]
-        mask_in_gts = bbox_deltas.view(bs, n_boxes, anchors.shape[0], -1).amin(3).gt_(1e-9) # [16, 64, 8400]
-
-        '''
-        target mask_in_gts: [16, 64, 8400, 2] (repeat)
-        target metrics: [16, 64, 8400, 2]
-
-        target top_k_metrics, top_k_indices: [16, 64, 10, 2] (maybe do for metrics[...:k,k+1] to get indiv topk, then cat)
-        '''
-        mask_in_gts = mask_in_gts.unsqueeze(-1).repeat(1,1,1,2) 
-        metrics = align_metric * mask_in_gts # [16, 64, 8400]
-        top_k_mask = true_mask.repeat([1, 1, self.top_k]).bool() # [16, 64, 10]
-        num_anchors = anchors.shape[0] # 8400
-
-        top_k_metrics0, top_k_indices0 = torch.topk(metrics[...,0:1].squeeze(-1), self.top_k, dim=-1, largest=True)
-        top_k_metrics1, top_k_indices1 = torch.topk(metrics[...,1:2].squeeze(-1), self.top_k, dim=-1, largest=True)
-        top_k_metrics = torch.cat((top_k_metrics0.unsqueeze(-1), top_k_metrics1.unsqueeze(-1)), dim=-1)
-        top_k_indices = torch.cat((top_k_indices0.unsqueeze(-1), top_k_indices1.unsqueeze(-1)), dim=-1)
-        # top_k_metrics, top_k_indices = torch.topk(metrics, self.top_k, dim=-1, largest=True) # [16, 64, 10] [16, 64, 10]
-        if top_k_mask is None:
-            print('top_k_mask is None')
-            top_k_mask = (top_k_metrics.max(-1, keepdim=True) > self.eps).tile([1, 1, self.top_k])
-
-        '''
-        continued from above section (talking abt top k METRICS)
-        target top_k_mask: [16, 64, 10, 2] (repeat top_k_mask)
-        target top_k_indices: [16, 64, 10, 2]
-        one_hot_topk: one_hot(top_k_indices, num_anchors) = [16, 64, 10, 8400] -> at 2 one_hots -> target: [16, 2, 64, 10, 8400]
-        target is_in_top_k: [16, 2, 64, 8400] (one_hot_topk.sum(-2))
-        '''
-        top_k_mask = top_k_mask.unsqueeze(-1).repeat(1,1,1,2)
-        top_k_indices = torch.where(top_k_mask, top_k_indices, 0) # [16, 64, 10]
-        is_in_top_k0 = one_hot(top_k_indices[...,0:1].squeeze(), num_anchors) # [16, 64, 8400]
-        is_in_top_k1 = one_hot(top_k_indices[...,1:2].squeeze(), num_anchors)
-        is_in_top_k = torch.cat((is_in_top_k0.unsqueeze(1), is_in_top_k1.unsqueeze(1)), dim=1)
-        is_in_top_k = is_in_top_k.sum(-2)
-        # filter invalid boxes
-        is_in_top_k = torch.where(is_in_top_k > 1, 0, is_in_top_k) # [16, 64, 8400]
-        mask_top_k = is_in_top_k.to(metrics.dtype) # [16, 64, 8400]
-        # merge all mask to a final mask, (b, max_num_obj, h*w)
-        '''
-        target mask_top_k = [16, 2, 64, 8400].permute(0,2,3,1) = [16, 64, 8400, 2]
-        split and flatten mask_top_k and mask_in_gts to 0 and 1: [16, 64, 8400, 2] -> [16, 64, 8400, 1] -> [16, 64, 8400]
-        mask_pos 0, 1 = [16, 64, 8400]*[16, 64, 8400]*[16, 64, 1] = [16, 64, 8400]
-        mask_pos = unsqueeze(-1), cat 0,1 -> [16, 64, 8400, 2]
-        target mask_pos: [16, 64, 8400, 2]
-        '''
-        mask_top_k = mask_top_k.permute(0,2,3,1)
-        mask_pos = mask_top_k * mask_in_gts * true_mask.unsqueeze(-1) # [16, 64, 8400]*[16, 64, 8400]*[16, 64, 1] = [16, 64, 8400]
-        '''
-        target fg_mask = mask_pos.sum(-3)
-        target fg_mask = [16, 8400, 2]
-        '''
-        fg_mask = mask_pos.sum(-3) # [16, 8400]
-        if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes # non-opmp will select the gt for highest iou
-            '''
-            fg_mask split 0,1 = [16, 8400, 1] [16, 8400, 1]
-            fg_mask 0,1 permute = [16, 1, 8400] [16, 1, 8400]
-
-            mask_multi_gts 0,1 = [16, 99, 8400] [16, 99, 8400] -> cat -> [16, 99, 2, 8400] -> permute [16, 99, 8400, 2]
-            overlaps: [16, 99, 8400, 2]
-            max_overlaps_idx : [16, 8400, 2]
-            is_max_overlaps: [16, 8400, 2, 99] -> permute -> # [16, 99, 8400, 2]
-            mask_pos: [16, 99, 8400, 2]
-            fg_mask: mask_pos.sum(-3) = [16, 8400, 2]
-            '''
-            fg_mask0, fg_mask1 = fg_mask.split(1, dim=-1)
-            fg_mask0 = fg_mask0.permute(0,2,1)
-            fg_mask1 = fg_mask1.permute(0,2,1)
-            
-            mask_multi_gts0 = (fg_mask0 > 1).repeat([1, self.num_max_boxes, 1]).unsqueeze(-2)
-            mask_multi_gts1 = (fg_mask1 > 1).repeat([1, self.num_max_boxes, 1]).unsqueeze(-2)
-            mask_multi_gts = torch.cat((mask_multi_gts0, mask_multi_gts1), dim=-2).permute(0,1,3,2)
-            # mask_multi_gts = (fg_mask.unsqueeze(1) > 1).repeat([1, self.num_max_boxes, 1]) # [16, 99, 8400]
-            max_overlaps_idx = overlaps.argmax(1) # [16, 8400] # for each image, each anchor uses which target(idx)
-            is_max_overlaps = one_hot(max_overlaps_idx, self.num_max_boxes) # [16, 8400, 99]
-            is_max_overlaps = is_max_overlaps.permute(0, 3, 1, 2).to(overlaps.dtype) # [16, 99, 8400]
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos) # [16, 99, 8400]
-            fg_mask = mask_pos.sum(-3) # [16, 8400]
-        
-        '''
-        target_gt_idx: mask_pos.argmax(-3) -> [16, 8400, 2]
-        '''
-        # find each grid serve which gt(index)
-        target_gt_idx = mask_pos.argmax(-3)  # (b, h*w) # [16, 8400]
-        '''
-        batch_index = torch.arange(end=self.bs,
-                                   dtype=torch.int64,
-                                   device=true_labels.device)[:,None, None] (16,1,1)
-        target_gt_idx: [16, 8400, 2]
-
-        target_labels = true_labels.long().flatten()[target_gt_idx.reshape(-1, 2)]
-        target_labels = target_labels.view(target_gt_idx.size())
-        target target_labels: [16, 8400, 2]
-        '''
-        # assigned target labels, (b, 1) 
-        batch_index = torch.arange(end=self.bs,
-                                   dtype=torch.int64,
-                                   device=true_labels.device)[:,None, None]  # [16, 1]
-        target_gt_idx = target_gt_idx + batch_index * self.num_max_boxes # [16, 8400]
-        target_labels = true_labels.long().flatten()[target_gt_idx.reshape(-1, 2)] # [16, 8400]
-        target_labels = target_labels.view(target_gt_idx.size())
-
-        '''
-        target target_bboxes: [16, 8400, 2, 4]
-        '''
-        # assigned target boxes
-        target_bboxes = true_bboxes.view(-1, 4)[target_gt_idx] # [16, 8400, 4]
-        '''
-        target_labels.clamp(0):  [16, 8400, 2]
-        target_scores: [16, 8400, 2, 1]
-
-        fg_mask: [16, 8400, 2]
-        fg_scores_mask = fg_mask.unsqueeze(-1).repeat(1, 1, 1, self.nc) -> [16, 8400, 2, 1]
-        '''        
-        # assigned target scores
-        target_labels.clamp(0) # [16, 8400]
-        target_scores = one_hot(target_labels, self.nc) # [16, 8400, 1]
-        fg_scores_mask = fg_mask.unsqueeze(-1).repeat(1, 1, 1, self.nc) # [16, 8400, 1]
-        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0) # [16, 8400, 1]
-
-        '''
-        align metric: [16,99,8400,2]
-        mask_pos: [16, 99, 8400, 2]
-        pos_align_metrics = align_metric.amax(axis=-2, keepdim=True) -> [16, 99, 1, 2]
-        pos_overlaps = (overlaps * mask_pos).amax(axis=-2, keepdim=True) -> [16, 99, 1, 2]
-        norm_align_metric = ...amax(-3) -> [16, 8400, 2]
-        target_scores: [16, 8400, 2, 1]
-        '''
-        # normalize
-        align_metric *= mask_pos # [16, 64, 8400]
-        pos_align_metrics = align_metric.amax(axis=-2, keepdim=True) # [16, 64, 1]
-        pos_overlaps = (overlaps * mask_pos).amax(axis=-2, keepdim=True) # [16, 64, 1])
-        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-3) # [16, 8400]
-        norm_align_metric = norm_align_metric.unsqueeze(-1) # [16, 8400, 1]
-        target_scores = target_scores * norm_align_metric # [16, 8400, 1]
-        '''
-        target_bboxes: [16, 8400, 2, 4]
-        target_scores: [16, 8400, 2, 1]
-        fg_mask: [16, 8400, 2]
-        '''
-        return target_bboxes, target_scores, fg_mask.bool()
-    '''
-    def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes, true_mask, anchors):
-        """
-        Task-aligned One-stage Object Detection assigner
-        
-        assigns ground-truth (gt) objects to anchors based on the task-aligned metric, which combines both
-        classification and localization information.
-
-        pred_scores: [16, 8400, 2]
-        pred_bboxes: [16, 8400, 8]
-        true labels: [16, max count, 1]
-        true_bboxes: [16, max count, 4]
-
-        """
-        self.bs = pred_scores.size(0) # 16 # batch size
-        self.num_max_boxes = true_bboxes.size(1) # 64 # max targets, from one image i.e. counts.max i think
-        self.k = 2
-
-        if self.num_max_boxes == 0:
-            device = true_bboxes.device
-            return (torch.full_like(pred_scores[..., 0], self.nc).to(device),
-                    torch.zeros_like(pred_bboxes).to(device),
-                    torch.zeros_like(pred_scores).to(device),
-                    torch.zeros_like(pred_scores[..., 0]).to(device),
-                    torch.zeros_like(pred_scores[..., 0]).to(device))
-
-        #i:  [([16, 64]), ([16, 64])]
-        #i:  [16, 2, 107], [16, 2, 107] OPMP, diff batch
-        i = torch.zeros([2, self.bs, self.k,  self.num_max_boxes], dtype=torch.long) # [2, 16, 2, 107]
-        i[0] = torch.arange(end=self.bs).view(-1, 1).repeat(1, self.num_max_boxes).unsqueeze(1).repeat(1,self.k,1) # [16, 2, 107]
-        i[1] = true_labels.long().squeeze(-1).unsqueeze(1).repeat(1,2,1)
-
-        # need to allocate up to k gt boxeswhen iou>threshold
-        # split pred_bboxes into list of bboxes
-        # indiv_pred_bboxes = list(torch.split(pred_bboxes, 4, -1)) # [[16, 8400, 4],[16, 8400, 4]]
-        # overlaps = [] # [[16, 89, 8400],[16, 89, 8400]]
-        # for i in range(self.k):
-        #     overlap = self.iou(true_bboxes.unsqueeze(2), indiv_pred_bboxes[i].unsqueeze(1))
-        #     overlaps.append(overlap.squeeze(3).clamp(0))
-
-        overlaps = torch.zeros([self.bs, self.num_max_boxes, pred_scores.size(1), self.k]).to(true_bboxes.device) #[16, maxtargets, 8400, 2]
-        align_metric = torch.zeros(self.bs, self.k*self.num_max_boxes, pred_scores.size(1)).to(true_bboxes.device) #[16, 2*maxtargets, 8400]
-        for k in range(self.k):
-            overlaps[..., k:k+1] = self.iou(true_bboxes.unsqueeze(2), pred_bboxes.split(4,-1)[k].unsqueeze(1)) # [16, maxtargets, 8400, 2]
-            print('pred_scores[..., k:k+1]', pred_scores[..., k:k+1].size()) # [16, 8400, 1]
-            print('pred_scores[..., k:k+1][i[0], :, i[1]]', pred_scores[..., k:k+1][i[0], :, i[1]].size()) 
-            print('overlaps[..., k:k+1].squeeze()',overlaps[..., k:k+1].squeeze().size()) 
-            a = pred_scores[..., k:k+1][i[0], :, i[1]].pow(self.alpha) # [16, 2, 107, 8400]
-            b = overlaps[..., k:k+1].squeeze().pow(self.beta) # [16, 107, 8400]
-            align_metric[16, k*self.num_max_boxes:k*self.num_max_boxes+self.num_max_boxes, pred_scores.size(1)] = a * b # [16, 64, 8400]
-        # overlaps = overlaps.squeeze(3).clamp(0) # [16, maxtargets, 8400])
         print('iou', overlaps.size())
-        print('align metric', align_metric.size())
-        # pred scores: [16, 8400, 2]
+        print('iou', overlaps)
+        # pred_scores[i[0], :, i[1]] = bbox scores = Get the scores of each grid for each gt cls # size = [16, maxtargets, 8400]
+        align_metric = pred_scores[i[0], :, i[1]].pow(self.alpha) * overlaps.pow(self.beta) # [16, 64, 8400]
+
         bs, n_boxes, _ = true_bboxes.shape # 16, 64
         lt, rb = true_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom # ([1024, 1, 2]) ([1024, 1, 2])
         bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2) # [1024, 8400, 4]
@@ -828,33 +612,33 @@ class ComputeLoss:
             top_k_mask = (top_k_metrics.max(-1, keepdim=True) > self.eps).tile([1, 1, self.top_k])
         top_k_indices = torch.where(top_k_mask, top_k_indices, 0) # [16, 64, 10]
         is_in_top_k = one_hot(top_k_indices, num_anchors).sum(-2) # [16, 64, 8400]
+        print('onehot', one_hot(top_k_indices, num_anchors))
+        print('isinonehot', is_in_top_k)
         # filter invalid boxes
         is_in_top_k = torch.where(is_in_top_k > 1, 0, is_in_top_k) # [16, 64, 8400]
+        print('isintopk', is_in_top_k)
         mask_top_k = is_in_top_k.to(metrics.dtype) # [16, 64, 8400]
         # merge all mask to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_top_k * mask_in_gts * true_mask # [16, 64, 8400]
-        mask_pos = mask_pos.unsqueeze(1).repeat(1,self.k,1,1) # [16, k, maxtargets, 8400]
 
         fg_mask = mask_pos.sum(-2) # [16, 8400]
-        if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes # opmp should select k gts with iou > threshold
+        if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes # non-opmp will select the gt for highest iou
             print('more than 1 gt assigned')
             print('fg masks', fg_mask)
-            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).repeat([1, self.num_max_boxes, 1]) # [16, 64, 8400]
+            mask_multi_gts = (fg_mask.unsqueeze(1) > 1).repeat([1, self.num_max_boxes, 1]) # [16, 99, 8400]
             print('mask multi gts', mask_multi_gts.size())
-            mask_multi_gts = mask_multi_gts.unsqueeze(1).repeat(1,self.k,1,1)# [16, k, maxtargets, 8400]
-            print('new mask multi gts', mask_multi_gts.size())
-            # for each image, each anchor uses which target(idx) # [16, 8400]
-            _, max_overlaps_idx = torch.topk(overlaps, self.k, -2) # [16, 2, 8400] # for each image, each anchor has 2 gts
-            max_overlaps_idx = max_overlaps_idx.permute(0,2,1) # [16, 8400, 2]
-            # max_overlaps_idx = overlaps.argmax(1) # [16, 8400] # should use topk instead of argmax
-            is_max_overlaps = one_hot(max_overlaps_idx, self.num_max_boxes) # [16, 8400, 64] top k=2 max iou: # [16, 8400, 2, maxtargets]
-            is_max_overlaps = is_max_overlaps.permute(0, 3, 2, 1).to(overlaps.dtype) # [16, maxtargets, 2 , 8400]
-            print('ismaxovalaps', is_max_overlaps.size())
-            # is_max_overlaps = is_max_overlaps.reshape(self.bs, -1, is_max_overlaps.shape[-1]) # [16, 2*maxtargets, 8400]
-            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos) # [16, 2*maxtargets, 8400]
+            print('mask multi gts', mask_multi_gts)
+            max_overlaps_idx = overlaps.argmax(1) # [16, 8400] # for each image, each anchor uses which target(idx)
+            print('overlaps', overlaps)
+            print('max overlaps idx', max_overlaps_idx)
+            # which target(idx) is highest overlap for each anchor point
+            is_max_overlaps = one_hot(max_overlaps_idx, self.num_max_boxes) # [16, 8400, 99]
+            print('ismaxovevrlaps', is_max_overlaps.size())
+            is_max_overlaps = is_max_overlaps.permute(0, 2, 1).to(overlaps.dtype) # [16, 99, 8400]
+            mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos) # [16, 99, 8400]
+            print('mask pos', mask_pos.size())
+            print('mask pos', mask_pos)
             fg_mask = mask_pos.sum(-2) # [16, 8400]
-            print('fg mask', fg_mask.size())
-
         # find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w) # [16, 8400]
         print('target gt index', target_gt_idx)
@@ -863,37 +647,226 @@ class ComputeLoss:
                                    dtype=torch.int64,
                                    device=true_labels.device)[..., None]  # [16, 1]
         target_gt_idx = target_gt_idx + batch_index * self.num_max_boxes # [16, 8400]
+        print('max,', torch.max(target_gt_idx,1 , keepdim=True))
         target_labels = true_labels.long().flatten()[target_gt_idx] # [16, 8400]
-        print('batch index', batch_index.size())
-        print('target gt idx', target_gt_idx.size())
-        print('target labels', target_labels.size())
+        print('true lbels', true_labels)
+        print('target labels', target_labels)
 
         # assigned target boxes
-        target_bboxes = true_bboxes.view(-1, 4)[target_gt_idx] # [16, 8400, 4]
-        print('target bboxes', target_bboxes.size())
+        target_bboxes = true_bboxes.view(-1, 4)[target_gt_idx]
+        print('target bboxes ', target_bboxes.size()) # [16, 8400, 4]
 
         # assigned target scores
         target_labels.clamp(0) # [16, 8400]
         target_scores = one_hot(target_labels, self.nc) # [16, 8400, 1]
         fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.nc) # [16, 8400, 1]
-        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0) # [16, 8400, 1]
-        print('fg_scores_mask', fg_scores_mask.size())
-        print('target_scoress', target_scores.size())
+        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0) # [16, 8400, 1
 
         # normalize
         align_metric *= mask_pos # [16, 64, 8400]
         pos_align_metrics = align_metric.amax(axis=-1, keepdim=True) # [16, 64, 1]
-        pos_overlaps = (overlaps.repeat(1, self.k, 1) * mask_pos).amax(axis=-1, keepdim=True) # [16, 64, 1])
+        pos_overlaps = (overlaps * mask_pos).amax(axis=-1, keepdim=True) # [16, 64, 1])
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2) # [16, 8400]
         norm_align_metric = norm_align_metric.unsqueeze(-1) # [16, 8400, 1]
         target_scores = target_scores * norm_align_metric # [16, 8400, 1]
 
-        # # [16, 8400, 4], [16, 8400, 1], # [16, 8400]
-        # OPMP target: [16, 8400, 8], [16, 8400, 2], # [16, 8400]
-        return target_bboxes, target_scores, fg_mask.bool()
-    '''
+        return target_bboxes, target_scores, fg_mask.bool()    
     
+    # def assign(self, pred_scores, pred_bboxes, true_labels, true_bboxes, true_mask, anchors):
+    #     """
+    #     Task-aligned One-stage Object Detection assigner
+        
+    #     assigns ground-truth (gt) objects to anchors based on the task-aligned metric, which combines both
+    #     classification and localization information.
 
+    #     pred_scores: [16, 8400, 1] -> [16, 8400, 2]
+    #     pred_bboxes: [16, 8400, 4] -> [16, 8400, 8]
+    #     true_labels: [16, max count, 1]
+    #     true_bboxes: [16, max count, 4]
+    #     true_mask: [16, max count, 1] (true for indices where there is a valid gt)
+    #     anchors: [8400, 2]
+    #     """
+    #     self.bs = pred_scores.size(0) # 16
+    #     self.num_max_boxes = true_bboxes.size(1) # 64
+
+    #     print('true_mask', true_mask.size())
+    #     print('anchors', anchors.size())
+
+    #     if self.num_max_boxes == 0:
+    #         device = true_bboxes.device
+    #         return (torch.full_like(pred_scores[..., 0], self.nc).to(device),
+    #                 torch.zeros_like(pred_bboxes).to(device),
+    #                 torch.zeros_like(pred_scores).to(device),
+    #                 torch.zeros_like(pred_scores[..., 0]).to(device),
+    #                 torch.zeros_like(pred_scores[..., 0]).to(device))
+
+    #     #i:  [torch.Size([16, 64]), ([16, 64])]
+    #     i = torch.zeros([2, self.bs, self.num_max_boxes], dtype=torch.long)
+    #     i[0] = torch.arange(end=self.bs).view(-1, 1).repeat(1, self.num_max_boxes)
+    #     i[1] = true_labels.long().squeeze(-1)
+
+    #     '''
+    #     target overlaps: [16,64,8400,2] (ious for 2 preds)
+    #     '''
+    #     overlap0 = self.iou(true_bboxes.unsqueeze(2), pred_bboxes[...,0:4].unsqueeze(1))
+    #     overlap1 = self.iou(true_bboxes.unsqueeze(2), pred_bboxes[...,4:8].unsqueeze(1))
+    #     overlaps = torch.cat((overlap0, overlap1), dim=-1)
+    #     # overlaps = self.iou(true_bboxes.unsqueeze(2), pred_bboxes.unsqueeze(1)) # [16, 64, 8400, 1] 
+    #     overlaps = overlaps.squeeze(3).clamp(0) # [16, 64, 8400])
+    #     # pred_scores[i[0], :, i[1]] = bbox scores = Get the scores of each grid for each gt cls # size = [16, maxtargets, 8400]
+    #     '''
+    #     target align_metrics: [16,64,8400,2] (metric for 2 pred scores)
+    #     '''
+    #     align_metric0 = pred_scores[...,0:1][i[0], :, i[1]].pow(self.alpha) * overlaps[...,0:1].squeeze(-1).pow(self.beta)
+    #     align_metric1 = pred_scores[...,1:2][i[0], :, i[1]].pow(self.alpha) * overlaps[...,1:2].squeeze(-1).pow(self.beta)
+    #     align_metric = torch.cat((align_metric0.unsqueeze(-1), align_metric1.unsqueeze(-1)), dim=-1)
+    #     # align_metric = pred_scores[i[0], :, i[1]].pow(self.alpha) * overlaps.pow(self.beta) # [16, 64, 8400]
+        
+    #     bs, n_boxes, _ = true_bboxes.shape # 16, 64
+    #     lt, rb = true_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom # ([1024, 1, 2]) ([1024, 1, 2])
+    #     bbox_deltas = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2) # [1024, 8400, 4]
+    #     mask_in_gts = bbox_deltas.view(bs, n_boxes, anchors.shape[0], -1).amin(3).gt_(1e-9) # [16, 64, 8400]
+
+    #     '''
+    #     target mask_in_gts: [16, 64, 8400, 2] (repeat)
+    #     target metrics: [16, 64, 8400, 2]
+
+    #     target top_k_metrics, top_k_indices: [16, 64, 10, 2] (maybe do for metrics[...:k,k+1] to get indiv topk, then cat)
+    #     '''
+    #     mask_in_gts = mask_in_gts.unsqueeze(-1).repeat(1,1,1,2) 
+    #     metrics = align_metric * mask_in_gts # [16, 64, 8400]
+    #     top_k_mask = true_mask.repeat([1, 1, self.top_k]).bool() # [16, 64, 10]
+    #     num_anchors = anchors.shape[0] # 8400
+
+    #     top_k_metrics0, top_k_indices0 = torch.topk(metrics[...,0:1].squeeze(-1), self.top_k, dim=-1, largest=True)
+    #     top_k_metrics1, top_k_indices1 = torch.topk(metrics[...,1:2].squeeze(-1), self.top_k, dim=-1, largest=True)
+    #     top_k_metrics = torch.cat((top_k_metrics0.unsqueeze(-1), top_k_metrics1.unsqueeze(-1)), dim=-1)
+    #     top_k_indices = torch.cat((top_k_indices0.unsqueeze(-1), top_k_indices1.unsqueeze(-1)), dim=-1)
+    #     # top_k_metrics, top_k_indices = torch.topk(metrics, self.top_k, dim=-1, largest=True) # [16, 64, 10] [16, 64, 10]
+    #     if top_k_mask is None:
+    #         print('top_k_mask is None')
+    #         top_k_mask = (top_k_metrics.max(-1, keepdim=True) > self.eps).tile([1, 1, self.top_k])
+
+    #     '''
+    #     continued from above section (talking abt top k METRICS)
+    #     target top_k_mask: [16, 64, 10, 2] (repeat top_k_mask)
+    #     target top_k_indices: [16, 64, 10, 2]
+    #     one_hot_topk: one_hot(top_k_indices, num_anchors) = [16, 64, 10, 8400] -> at 2 one_hots -> target: [16, 2, 64, 10, 8400]
+    #     target is_in_top_k: [16, 2, 64, 8400] (one_hot_topk.sum(-2))
+    #     '''
+    #     top_k_mask = top_k_mask.unsqueeze(-1).repeat(1,1,1,2)
+    #     top_k_indices = torch.where(top_k_mask, top_k_indices, 0) # [16, 64, 10]
+    #     is_in_top_k0 = one_hot(top_k_indices[...,0:1].squeeze(), num_anchors) # [16, 64, 8400]
+    #     is_in_top_k1 = one_hot(top_k_indices[...,1:2].squeeze(), num_anchors)
+    #     is_in_top_k = torch.cat((is_in_top_k0.unsqueeze(1), is_in_top_k1.unsqueeze(1)), dim=1)
+    #     is_in_top_k = is_in_top_k.sum(-2)
+    #     # filter invalid boxes
+    #     is_in_top_k = torch.where(is_in_top_k > 1, 0, is_in_top_k) # [16, 64, 8400]
+    #     mask_top_k = is_in_top_k.to(metrics.dtype) # [16, 64, 8400]
+    #     # merge all mask to a final mask, (b, max_num_obj, h*w)
+    #     '''
+    #     target mask_top_k = [16, 2, 64, 8400].permute(0,2,3,1) = [16, 64, 8400, 2]
+    #     split and flatten mask_top_k and mask_in_gts to 0 and 1: [16, 64, 8400, 2] -> [16, 64, 8400, 1] -> [16, 64, 8400]
+    #     mask_pos 0, 1 = [16, 64, 8400]*[16, 64, 8400]*[16, 64, 1] = [16, 64, 8400]
+    #     mask_pos = unsqueeze(-1), cat 0,1 -> [16, 64, 8400, 2]
+    #     target mask_pos: [16, 64, 8400, 2]
+    #     '''
+    #     mask_top_k = mask_top_k.permute(0,2,3,1)
+    #     mask_pos = mask_top_k * mask_in_gts * true_mask.unsqueeze(-1) # [16, 64, 8400]*[16, 64, 8400]*[16, 64, 1] = [16, 64, 8400]
+    #     '''
+    #     target fg_mask = mask_pos.sum(-3)
+    #     target fg_mask = [16, 8400, 2]
+    #     '''
+    #     fg_mask = mask_pos.sum(-3) # [16, 8400]
+    #     if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes # non-opmp will select the gt for highest iou
+    #         '''
+    #         fg_mask split 0,1 = [16, 8400, 1] [16, 8400, 1]
+    #         fg_mask 0,1 permute = [16, 1, 8400] [16, 1, 8400]
+
+    #         mask_multi_gts 0,1 = [16, 99, 8400] [16, 99, 8400] -> cat -> [16, 99, 2, 8400] -> permute [16, 99, 8400, 2]
+    #         overlaps: [16, 99, 8400, 2]
+    #         max_overlaps_idx : [16, 8400, 2]
+    #         is_max_overlaps: [16, 8400, 2, 99] -> permute -> # [16, 99, 8400, 2]
+    #         mask_pos: [16, 99, 8400, 2]
+    #         fg_mask: mask_pos.sum(-3) = [16, 8400, 2]
+    #         '''
+    #         fg_mask0, fg_mask1 = fg_mask.split(1, dim=-1)
+    #         fg_mask0 = fg_mask0.permute(0,2,1)
+    #         fg_mask1 = fg_mask1.permute(0,2,1)
+            
+    #         mask_multi_gts0 = (fg_mask0 > 1).repeat([1, self.num_max_boxes, 1]).unsqueeze(-2)
+    #         mask_multi_gts1 = (fg_mask1 > 1).repeat([1, self.num_max_boxes, 1]).unsqueeze(-2)
+    #         mask_multi_gts = torch.cat((mask_multi_gts0, mask_multi_gts1), dim=-2).permute(0,1,3,2)
+    #         # mask_multi_gts = (fg_mask.unsqueeze(1) > 1).repeat([1, self.num_max_boxes, 1]) # [16, 99, 8400]
+    #         max_overlaps_idx = overlaps.argmax(1) # [16, 8400] # for each image, each anchor uses which target(idx)
+    #         is_max_overlaps = one_hot(max_overlaps_idx, self.num_max_boxes) # [16, 8400, 99]
+    #         is_max_overlaps = is_max_overlaps.permute(0, 3, 1, 2).to(overlaps.dtype) # [16, 99, 8400]
+    #         mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos) # [16, 99, 8400]
+    #         fg_mask = mask_pos.sum(-3) # [16, 8400]
+        
+    #     '''
+    #     target_gt_idx: mask_pos.argmax(-3) -> [16, 8400, 2]
+    #     '''
+    #     # find each grid serve which gt(index)
+    #     target_gt_idx = mask_pos.argmax(-3)  # (b, h*w) # [16, 8400]
+    #     '''
+    #     batch_index = torch.arange(end=self.bs,
+    #                                dtype=torch.int64,
+    #                                device=true_labels.device)[:,None, None] (16,1,1)
+    #     target_gt_idx: [16, 8400, 2]
+
+    #     target_labels = true_labels.long().flatten()[target_gt_idx.reshape(-1, 2)]
+    #     target_labels = target_labels.view(target_gt_idx.size())
+    #     target target_labels: [16, 8400, 2]
+    #     '''
+    #     # assigned target labels, (b, 1) 
+    #     batch_index = torch.arange(end=self.bs,
+    #                                dtype=torch.int64,
+    #                                device=true_labels.device)[:,None, None]  # [16, 1]
+    #     target_gt_idx = target_gt_idx + batch_index * self.num_max_boxes # [16, 8400]
+    #     target_labels = true_labels.long().flatten()[target_gt_idx.reshape(-1, 2)] # [16, 8400]
+    #     target_labels = target_labels.view(target_gt_idx.size())
+
+    #     '''
+    #     target target_bboxes: [16, 8400, 2, 4]
+    #     '''
+    #     # assigned target boxes
+    #     target_bboxes = true_bboxes.view(-1, 4)[target_gt_idx] # [16, 8400, 4]
+    #     '''
+    #     target_labels.clamp(0):  [16, 8400, 2]
+    #     target_scores: [16, 8400, 2, 1]
+
+    #     fg_mask: [16, 8400, 2]
+    #     fg_scores_mask = fg_mask.unsqueeze(-1).repeat(1, 1, 1, self.nc) -> [16, 8400, 2, 1]
+    #     '''        
+    #     # assigned target scores
+    #     target_labels.clamp(0) # [16, 8400]
+    #     target_scores = one_hot(target_labels, self.nc) # [16, 8400, 1]
+    #     fg_scores_mask = fg_mask.unsqueeze(-1).repeat(1, 1, 1, self.nc) # [16, 8400, 1]
+    #     target_scores = torch.where(fg_scores_mask > 0, target_scores, 0) # [16, 8400, 1]
+
+    #     '''
+    #     align metric: [16,99,8400,2]
+    #     mask_pos: [16, 99, 8400, 2]
+    #     pos_align_metrics = align_metric.amax(axis=-2, keepdim=True) -> [16, 99, 1, 2]
+    #     pos_overlaps = (overlaps * mask_pos).amax(axis=-2, keepdim=True) -> [16, 99, 1, 2]
+    #     norm_align_metric = ...amax(-3) -> [16, 8400, 2]
+    #     target_scores: [16, 8400, 2, 1]
+    #     '''
+    #     # normalize
+    #     align_metric *= mask_pos # [16, 64, 8400]
+    #     pos_align_metrics = align_metric.amax(axis=-2, keepdim=True) # [16, 64, 1]
+    #     pos_overlaps = (overlaps * mask_pos).amax(axis=-2, keepdim=True) # [16, 64, 1])
+    #     norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-3) # [16, 8400]
+    #     norm_align_metric = norm_align_metric.unsqueeze(-1) # [16, 8400, 1]
+    #     target_scores = target_scores * norm_align_metric # [16, 8400, 1]
+    #     '''
+    #     target_bboxes: [16, 8400, 2, 4]
+    #     target_scores: [16, 8400, 2, 1]
+    #     fg_mask: [16, 8400, 2]
+    #     '''
+    #     return target_bboxes, target_scores, fg_mask.bool()
+    
     @staticmethod
     def df_loss(pred_dist, target):
         # Return sum of left and right DFL losses

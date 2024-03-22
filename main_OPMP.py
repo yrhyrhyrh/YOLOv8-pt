@@ -108,9 +108,9 @@ def train(args, params):
                 print('targets', targets.size())
                 x = i + num_batch * epoch  # number of iterations
                 # samples: 16 images [16, 3, 640, 640]
-                samples = samples.cuda().float() / 255 
+                samples = samples.cuda().float() / 255  # [32, 3, 640, 640]
                 # target boxes: tensors of [image index (0-15), class, x_center, y_center, width, height]
-                targets = targets.cuda()
+                targets = targets.cuda() # [x, 6]
 
                 # Warmup
                 if x <= num_warmup:

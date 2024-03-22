@@ -3,6 +3,9 @@
 **/data
 **/data2
 **/error
+**/best2.pt
+**/last2.pt
+**/step2.csv
 
 **/*.out
 **/*.json

@@ -175,7 +175,7 @@ class Head(torch.nn.Module):
         self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, c2, 3), #in=256 for x=0, in=512 for x=1,2. out=64. kernelsize=3
                                                            Conv(c2, c2, 3), #in=64 out=64. kernelsize=3
                                                            torch.nn.Conv2d(c2, 4 * self.ch * self.k, 1)) for x in filters) #in=64 out=64 kernelsize=1 pointwise
-
+        
     def forward(self, x):
         print('forward head')
         # input x is output from darknetFPN, [torch.Size([16, 256, 80, 80]), torch.Size([16, 512, 40, 40]), torch.Size([16, 512, 20, 20])]
@@ -186,11 +186,23 @@ class Head(torch.nn.Module):
             # after torch.cat: [[8, 130, 80, 80], [8, 130, 40, 40], [8, 130, 20, 20]]
         if self.training:
             return x
+        
+        # z = []
+        # for i in range(self.nl):
+        #     bs, _, ny, nx = x[i].shape
+        #     cls_pred = self.cls[i](x[i]).view(bs, self.nc, self.k, ny, nx).permute(0, 2, 1, 3, 4).contiguous()
+        #     box_pred = self.box[i](x[i]).view(bs, 4, self.k, ny, nx).permute(0, 2, 1, 3, 4).contiguous()
+
+        #     # Combine cls and box predictions for each proposal
+        #     pred = torch.cat([box_pred, cls_pred], 2).view(bs, self.k, self.nc + 4, ny, nx)
+        #     z.append(pred)
+        # if self.training:
+        #     return z
+            
         # stop here cuz training
         print('making anchor in head')
         # [2, 8400], [1, 8400]
         self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
-        print('anchrs, stride', self.anchors.size(), self.strides.size())
 
         x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2 )  # [8, 130, 8400]
         box, cls = x.split((self.ch * 4 * self.k, self.nc * self.k), 1) # [8, 128, 8400], [8, 2, 8400]
@@ -208,21 +220,19 @@ class Head(torch.nn.Module):
         b0 = self.anchors.unsqueeze(0) + b0
         b1 = self.anchors.unsqueeze(0) + b1
         # b = self.anchors.unsqueeze(0) + b
-        print('a,b after', a0.size(), b0.size())
 
         box0 = torch.cat(((a0 + b0) / 2, b0 - a0), 1)
         box1 = torch.cat(((a1 + b1) / 2, b1 - a1), 1)
         # box = torch.cat(((a + b) / 2, b - a), 1)
-        print('box', box0.size())
 
         output0 = torch.cat((box0 * self.strides, cls0.sigmoid()), 1).unsqueeze(1)
         output1 = torch.cat((box1 * self.strides, cls1.sigmoid()), 1).unsqueeze(1)
-        print('output size: ', torch.cat((output0, output1), 1).size())
         return torch.cat((output0, output1), 1)
 
     def initialize_biases(self):
         # Initialize biases
         # WARNING: requires stride availability
+        print('initializing biases')
         m = self
         for a, b, s in zip(m.box, m.cls, m.stride):
             a[-1].bias.data[:] = 1.0  # box

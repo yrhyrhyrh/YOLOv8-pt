@@ -3,7 +3,7 @@
 ##Job Script for FYP
 
 #SBATCH --partition=SCSEGPU_UG
-#SBATCH --qos=q_ug24
+#SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --nodelist=SCSEGPU-TC1-02
 #SBATCH --gres=gpu:1
@@ -16,7 +16,7 @@
 module load cuda/12.1
 module load anaconda
 source activate torch
-python3 -m torch.distributed.launch --use-env --nproc_per_node=1 main.py --train
+python3 -m torch.distributed.launch --use-env --nproc_per_node=1 main.py --detect
 # python3 ./tools/test.py -md retina_fpn_baseline -r 35
 
 # python3 ./tools/eval_json.py -f /home/FYP/ryu007/CrowdDet/model/rcnn_fpn_baseline/outputs/eval_dump/dump-20.json

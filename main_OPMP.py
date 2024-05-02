@@ -14,6 +14,9 @@ from nets import nn_OPMP
 from utils import util_OPMP
 from utils.dataset import Dataset
 
+import cv2
+import numpy as np
+
 warnings.filterwarnings("ignore")
 
 
@@ -210,7 +213,7 @@ def test(args, params, model=None):
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
     if model is None:
-        model = torch.load('./weights/best.pt', map_location='cuda')['model'].float()
+        model = torch.load('/home/FYP/ryu007/YOLOv8-pt/best_yopmp.pt', map_location='cuda')['model'].float()
 
     model.half()
     model.eval()
@@ -300,6 +303,81 @@ def test(args, params, model=None):
     model.float()  # for training
     return map50, mean_ap
 
+def detect(image_path, model=None, device='cuda', input_size=640):
+    # Load the image using OpenCV
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"No image found at {image_path}")
+
+    # Convert BGR to RGB
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Resize the image preserving the aspect ratio
+    h, w, _ = image.shape
+    scale = input_size / max(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    image_resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    # Calculate padding to make the image square [input_size, input_size]
+    top = (input_size - nh) // 2
+    bottom = input_size - nh - top
+    left = (input_size - nw) // 2
+    right = input_size - nw - left
+    image_padded = cv2.copyMakeBorder(image_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+
+    # Normalize the image
+    image_normalized = image_padded.astype(np.float32) / 255.0
+    image_transposed = np.transpose(image_normalized, (2, 0, 1))  # Convert HWC to CHW
+    image_tensor = torch.from_numpy(image_transposed).unsqueeze(0).to(device)  # Add batch dimension and move to device
+
+    # Load the model if not provided
+    if model is None:
+        model_path = '/home/FYP/ryu007/YOLOv8-pt/best_yopmp.pt'
+        model = torch.load(model_path, map_location=device)['model'].float()
+    model.eval()
+    model.to(device)
+    with torch.no_grad():
+        pred = model(image_tensor)
+
+    # Apply non-maximum suppression for bounding boxes
+    pred_nms = util_OPMP.set_non_max_suppression(pred, 0.3, 0.5)[0]
+    print('outputs', [x.size() for x in pred_nms])
+
+    # Process detections
+    if pred_nms is not None and len(pred_nms) > 0:
+        pred_nms[:, :4] = scale_coords(image_tensor.shape[2:], pred_nms[:, :4], image_padded.shape).round()
+        # Draw bounding boxes and save the image
+        for x1, y1, x2, y2, conf, cls_conf in pred_nms:
+            cv2.rectangle(image_padded, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 1)
+            # cv2.putText(image_padded, f'{cls_conf:.0f}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        output_path = "/home/FYP/ryu007/YOLOv8-pt/detected.jpg"
+        cv2.imwrite(output_path, cv2.cvtColor(image_padded, cv2.COLOR_RGB2BGR))
+        return pred_nms.cpu().numpy()
+    else:
+        print("No detections.")
+        return np.array([])  # Return an empty array if no detections
+
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    # Scale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = max(img1_shape) / max(img0_shape)  # gain  = old / new
+        pad = ((img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2)  # wh padding
+    else:
+        gain = ratio_pad[0]
+        pad = ratio_pad[1]
+
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    clip_coords(coords, img0_shape)
+    return coords
+
+def clip_coords(boxes, img_shape):
+    # Clip bounding xyxy bounding boxes to image shape (height, width)
+    boxes[:, 0].clamp_(0, img_shape[1])  # x1
+    boxes[:, 1].clamp_(0, img_shape[0])  # y1
+    boxes[:, 2].clamp_(0, img_shape[1])  # x2
+    boxes[:, 3].clamp_(0, img_shape[0])  # y2
 
 def main():
     parser = argparse.ArgumentParser()
@@ -309,6 +387,7 @@ def main():
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--detect', action='store_true')
     args = parser.parse_args()
 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
@@ -332,6 +411,8 @@ def main():
         train(args, params)
     if args.test:
         test(args, params)
+    if args.detect:
+        detect(image_path = '/home/FYP/ryu007/YOLOv8-pt/data/images/val/284193,c5e300074ca4b38.jpg', model=None)
 
 
 if __name__ == "__main__":

@@ -380,8 +380,8 @@ def detect(image_path, model=None, device='cuda', input_size=640):
         pred_nms[:, :4] = scale_coords(image_tensor.shape[2:], pred_nms[:, :4], image_padded.shape).round()
         # Draw bounding boxes and save the image
         for x1, y1, x2, y2, conf, cls_conf in pred_nms:
-            cv2.rectangle(image_padded, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(image_padded, f'{cls_conf:.0f}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            cv2.rectangle(image_padded, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 1)
+            # cv2.putText(image_padded, f'{cls_conf:.0f}', (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         output_path = "/home/FYP/ryu007/YOLOv8-pt/detected.jpg"
         cv2.imwrite(output_path, cv2.cvtColor(image_padded, cv2.COLOR_RGB2BGR))
         return pred_nms.cpu().numpy()
